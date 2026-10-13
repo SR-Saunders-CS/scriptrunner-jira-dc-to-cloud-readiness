@@ -99,7 +99,7 @@ Each row has a link to manage that script in ScriptRunner admin.
 - Runs from the last few minutes may not show yet. The ScriptRunner Performance tab is real-time.
 - "0 days" isn't proof a script is unneeded. Usage isn't value either: a script that runs once a year can be critical. The owner decides.
 - "Projects / scope" is where a script is configured to apply, not which projects triggered it.
-- Tested on a single node only. Clusters, large instances and Full depth are untested. Checks you can run yourself: [docs/testing-checklist.md](docs/testing-checklist.md).
+
 
 How the data is read, and why: [docs/how-it-works.md](docs/how-it-works.md).
 
@@ -114,10 +114,8 @@ How the data is read, and why: [docs/how-it-works.md](docs/how-it-works.md).
 | "No usage folder found for cluster node(s)" warning | A node in the cluster has no usage files, so nothing is marked unused. Check that node with your Jira administrator; a brand-new node that hasn't run a script yet also causes this. |
 | "RRD directory not found" warning | ScriptRunner usage files weren't found, so nothing is marked unused. Check ScriptRunner is installed and has run scripts. |
 
-## Feedback
 
-Found a problem? Open an [issue](../../issues) with your Jira and ScriptRunner versions. Best effort only: no response time is promised.
 
 ## Version
 
-1.0.0, tested on Jira 10.3.24 and ScriptRunner 9.30.0, single node. See [CHANGELOG.md](CHANGELOG.md).
+1.0.0, tested on Jira 10.3.24 and ScriptRunner 9.30.0, single node.
