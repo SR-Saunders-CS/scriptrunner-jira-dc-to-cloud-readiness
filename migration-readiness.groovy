@@ -1284,6 +1284,10 @@ reportHtml = OutputFormatter.markupBuilder { builder ->
 .mri details > summary:hover { background: #DEEBFF; }
 .mri details > summary:hover::after { text-decoration: underline; }
 .mri details > summary:focus-visible { outline: 2px solid #0052CC; outline-offset: 1px; }
+.mri details > summary[data-open]::after { content: attr(data-open); }
+.mri details[open] > summary[data-close]::after { content: attr(data-close); }
+.mri details.mri-group { border-left-width: 8px; margin: 10px 0; }
+.mri details.mri-group > summary { font-size: 15px; padding: 12px 12px; }
 .mri details[open] > summary { border-bottom: 1px solid #B3D4FF; border-radius: 4px 4px 0 0; }
 .mri details.mri-row { border: 1px solid #4C9AFF; border-left-width: 4px; border-radius: 4px; margin: 6px 0; background: #fff; }
 .mri details.mri-row > summary { padding: 8px 10px; font-size: 13px; }
@@ -1735,7 +1739,13 @@ reportHtml = OutputFormatter.markupBuilder { builder ->
                     }
                 }
             }
-            p(class: 'mri-hint', style: 'margin:0 0 8px') { mkp.yield "The bar is a picture only. Click a group below to see each script: on how many days it ran in the last ${SR_DAYS_TXT}, and when it last ran. Archive or delete is open first." }
+            p(class: 'mri-hint', style: 'margin:0 0 8px') { mkp.yield 'The bar is a picture only.' }
+            div(style: 'border-top:2px solid #172B4D;margin:14px 0 4px;padding-top:8px') {
+                div(style: 'font-size:16px;font-weight:bold') { mkp.yield 'Your scripts, by decision' }
+                p(style: 'font-size:13px;margin:2px 0 0') {
+                    mkp.yield "Each coloured bar below is one group (${SR_GROUPS.count { srRowsByGroup[it.key as String] }} in total). Click a bar to show or hide its scripts: on how many days each ran in the last ${SR_DAYS_TXT}, and when it last ran. Archive or delete is already open.".toString()
+                }
+            }
 
             // Drill-down: one collapsible group per colour
             SR_GROUPS.findAll { srRowsByGroup[it.key as String] }.each { Map g ->
@@ -1754,7 +1764,9 @@ reportHtml = OutputFormatter.markupBuilder { builder ->
                     return (x.type as String) <=> (y.type as String) ?: (x.name as String) <=> (y.name as String)
                 }
                 String sortNote = g.key == 'RETIRE' ? 'Longest unused first.' : (g.key in ['INUSE', 'IDENTIFY'] ? 'Ran on the most days first, then most recent.' : '')
-                mkp.yieldUnescaped("<details class='mri-sub'" + (g.key == 'RETIRE' ? ' open' : '') + "><summary>" + groupPill(g) + '&nbsp; ')
+                String edge = g.colour == '#DFE1E6' ? '#6B778C' : (g.colour as String)
+                mkp.yieldUnescaped("<details class='mri-sub mri-group' style='border-left-color:${edge}'" + (g.key == 'RETIRE' ? ' open' : '') +
+                        "><summary data-open='Show list (${rs.size()})' data-close='Hide list'>" + groupPill(g) + '&nbsp; ')
                 mkp.yield "${g.title} (${rs.size()})"
                 span(class: 'mri-hint') { mkp.yield ' — ' + (g.explain as String) }
                 mkp.yieldUnescaped("</summary><div>")
@@ -1805,6 +1817,11 @@ reportHtml = OutputFormatter.markupBuilder { builder ->
                     }
                     if (sortNote) p(class: 'mri-hint', style: 'margin:4px 0 0') { mkp.yield sortNote }
                     moreNote(rs.size(), 'Use "Copy the full list" below to get every script.')
+                    if (g.key == 'RETIRE') {
+                        div(style: 'margin:10px 0 2px;padding:6px 10px;background:#DEEBFF;border-radius:4px;font-size:13px;font-weight:bold') {
+                            mkp.yield "End of the Archive or delete list. More groups below: Keep (${nKeep}), Check first (${nCheck}). Click a bar to open it. ↓".toString()
+                        }
+                    }
                 }
                 mkp.yieldUnescaped("</div></details>")
             }
