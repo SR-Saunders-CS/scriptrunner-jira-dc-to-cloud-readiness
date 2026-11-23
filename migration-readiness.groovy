@@ -11,23 +11,41 @@
 //   • Does NOT replace the ScriptRunner Migration Suite. Its Analyse and Assess
 //     tool shows what can be brought to Cloud and how; you still analyse,
 //     convert and deploy there.
-//   • Network: only "Full" depth (or Custom with CUSTOM_MARKETPLACE_LOOKUP = true)
-//     sends plugin keys to marketplace.atlassian.com. Quick and Standard make
-//     no network calls.
+//   • Network: none, unless form option 7 (Marketplace lookups) is ticked. That
+//     sends app keys to marketplace.atlassian.com.
 //
 // WHAT IT DOES
 //   Shows how much each ScriptRunner script is used on Data Center — on how
-//   many days it ran in the last N days, and when it last ran — so customers can consider retiring
-//   unused scripts BEFORE converting anything. Then lists wider Jira areas,
-//   ordered by relevance to ScriptRunner. Usage only: it never judges what can
+//   many days it ran in the last N days, and when it last ran — so customers can archive or delete
+//   unused scripts BEFORE converting anything. By default it checks ScriptRunner
+//   only. Wider Jira areas are added with the "Include" options. Usage only: it never judges what can
 //   or cannot move to Cloud.
 //
 // HOW TO RUN
 //   1. Paste this whole file into the Script Console and click Run. The options
 //      form appears above the script.
-//   2. Choose options, or leave them blank for the defaults (Quick depth, 50s
-//      time limit). Click Run again.
-//   3. Read the HTML report below the console. Start with "Read this first".
+//   2. Leave everything blank for a ScriptRunner-only scan (50s time limit), or
+//      tick "Include" options for more. Click Run again.
+//   3. Read the HTML report below the console. Start with the decision summary:
+//      Keep / Archive or delete / Check first.
+//
+// SAFETY BUILT IN (v1.1.0)
+//   • Only one run at a time per node: clicking Run again while a run is still going
+//     shows a "still running" message instead of starting a second run.
+//   • Maximum run time is capped at 300 seconds by default (TIME_BUDGET_MAX_SEC in
+//     ADVANCED SETTINGS). Only raise it if your proxy waits longer than that.
+//   • ScriptRunner only by default. Everything else is opt-in.
+//   • User email checks are skipped above 50,000 users (they load every user into memory).
+//   • A check that fails is reported with a fix; the rest of the report still shows.
+//   • Unknown usage is never shown as unused.
+//
+// IF SOMETHING GOES WRONG
+//   • Page hangs or goes blank: the run carries on on the server until it finishes.
+//     Do not click Run again. Wait 5 minutes, reload the console, paste, set a lower
+//     time limit (e.g. 40) and untick every "Include" option, then click Run once.
+//   • "Another run is still in progress": wait the minutes shown, then run once.
+//   • Report shows "Problems in this run": each problem lists its fix.
+//   • Red error text instead of a report: copy it and send it to your Adaptavist contact.
 // ═══════════════════════════════════════════════════════════════════════════
 
 import com.atlassian.applinks.api.ApplicationLink
@@ -56,9 +74,7 @@ import com.onresolve.jira.behaviours.BehaviourManager
 import com.onresolve.scriptrunner.canned.util.OutputFormatter
 import com.onresolve.scriptrunner.parameters.annotation.Checkbox
 import com.onresolve.scriptrunner.parameters.annotation.NumberInput
-import com.onresolve.scriptrunner.parameters.annotation.Select
 import com.onresolve.scriptrunner.parameters.annotation.ShortTextInput
-import com.onresolve.scriptrunner.parameters.annotation.meta.Option
 import com.onresolve.scriptrunner.scheduled.ScheduledScriptJobManager
 import com.onresolve.scriptrunner.scheduled.model.AbstractScheduledJobCommand
 import com.opensymphony.workflow.loader.ActionDescriptor
@@ -73,117 +89,83 @@ import org.rrd4j.core.RrdDb
 // ║  this script (ScriptRunner Dynamic Forms). Every field is optional:  ║
 // ║  leave it blank and the default shown in its description is used.   ║
 // ╚══════════════════════════════════════════════════════════════════════╝
-@Select(
-        label = '1. How thorough should the report be?',
-        description = 'Why we ask: deeper checks give a fuller picture but take longer. Every option includes ScriptRunner usage. ' +
-                'Quick = ScriptRunner usage plus Jira counts; fastest, no internet needed. ' +
-                'Standard = Quick plus checking every user\'s email address; slower on very large instances. ' +
-                'Full = Standard plus looking up each app on the Atlassian Marketplace; needs internet access from the Jira server. ' +
-                'Custom = uses the settings inside the script. Blank = Quick.',
-        options = [
-                @Option(label = 'Quick — ScriptRunner usage + Jira counts (recommended first run)', value = 'QUICK'),
-                @Option(label = 'Standard — adds user email checks', value = 'STANDARD'),
-                @Option(label = 'Full — adds Marketplace app lookups (needs internet)', value = 'FULL'),
-                @Option(label = 'Custom — uses the settings inside the script', value = 'CUSTOM'),
-        ]
-)
-String FORM_DEPTH
-
-@NumberInput(label = '2. Maximum run time (seconds)',
+@NumberInput(label = '1. Maximum run time (seconds)',
         description = 'Why we ask: on large instances the report can take a while, and browsers or proxies often stop waiting ' +
                 '(commonly after about 60 seconds), losing the result. After this many seconds the report stops starting new checks, ' +
-                'shows what it has, and lists anything it skipped so you can re-run just those. ' +
-                'Effect: lower = safer but may skip checks; higher = more complete but riskier. Blank = 50. ' +
-                'Large instance? First run at Quick with options 5, 6 and 7 ticked (ScriptRunner usage only).')
+                'shows what it has, and lists anything it skipped so you can re-run. ' +
+                'Effect: lower = safer but may skip checks; higher = more complete but riskier. Blank = 50. Maximum 300 unless raised in the script\'s advanced settings (TIME_BUDGET_MAX_SEC). ' +
+                'Only go above 60 if your proxy or load balancer waits longer; otherwise the report is lost when the browser gives up.')
 Integer FORM_TIME_BUDGET
 
-@NumberInput(label = '3. Treat a ScriptRunner script as unused after (days)',
-        description = 'Why we ask: scripts that have not run recently are worth considering for retirement ' +
-                'instead of migrate, which can shrink the migration. Scripts with no recorded run in this many days are marked DORMANT. ' +
-                'Effect: shorter = more scripts flagged as unused; longer = fewer. Blank = 90.')
+@NumberInput(label = '2. Treat a ScriptRunner script as unused after (days)',
+        description = 'Why we ask: scripts that have not run recently are worth considering for archiving or deleting ' +
+                'instead of converting, which can shrink the migration. Scripts with no recorded run in this many days are listed under Archive or delete. ' +
+                'Effect: shorter = more scripts flagged as unused; longer = fewer. Widen it (e.g. 365) to catch yearly scripts. Blank = 90.')
 Integer FORM_DORMANT_DAYS
 
-@ShortTextInput(label = '4. Script Listener names (optional)',
+@ShortTextInput(label = '3. Script Listener names (optional)',
         description = 'Why we ask: ScriptRunner cannot list listener names automatically, so listeners ' +
                 'appear as "Not matched" in the report. Effect: entering names labels them properly. ' +
                 'Format: uuid=Name; uuid=Name. Find a UUID in SR admin → Listeners → Edit → the last part of the browser URL. Blank = skip.')
 String FORM_LISTENER_NAMES
 
-// "Leave out" boxes: by default the report shows everything, ScriptRunner first.
-// Tick a box to leave that group out — it is neither checked nor shown, so the run is faster.
-@Checkbox(label = '5. Leave out: Jira areas that host ScriptRunner scripts',
+// "Include" boxes: by default the report checks ScriptRunner only (plus the Jira version).
+// Tick a box to add that group. Each one adds time and load.
+@Checkbox(label = '4. Include: Jira areas that host ScriptRunner scripts',
         description = 'Workflows (where post-functions live), custom fields (where script fields live) and projects (where scripts apply). ' +
-                'Why you might keep it: it explains where the scripts in the ScriptRunner section are used. Unticked = included.')
-Boolean FORM_HIDE_SR_CONTEXT
+                'Why you might add it: it explains where the scripts are used. Unticked = not included.')
+Boolean FORM_INCLUDE_SR_CONTEXT
 
-@Checkbox(label = '6. Leave out: wider migration readiness',
+@Checkbox(label = '5. Include: wider migration readiness',
         description = 'Apps, application links, users, user directories, issue volume, issue security and server timezone. ' +
-                'Why you might keep it: these affect the overall Jira migration plan, beyond ScriptRunner. Unticked = included.')
-Boolean FORM_HIDE_READINESS
+                'Why you might add it: these affect the overall Jira migration plan, beyond ScriptRunner. Unticked = not included.')
+Boolean FORM_INCLUDE_READINESS
 
-@Checkbox(label = '7. Leave out: instance inventory',
-        description = 'System information, groups, issue types and statuses, schemes, field configurations and screens — counts for information. ' +
-                'Why you might keep it: a complete record of the instance. Unticked = included.')
-Boolean FORM_HIDE_INVENTORY
+@Checkbox(label = '6. With option 5: check every user\'s email address',
+        description = 'Finds users with a missing or shared email address. Loads every user into memory, so it is skipped above 50,000 users. ' +
+                'Only used when option 5 is ticked. Unticked = not included.')
+Boolean FORM_INCLUDE_USER_EMAILS
+
+@Checkbox(label = '7. With option 5: look up apps on the Atlassian Marketplace',
+        description = 'Checks each third-party app against marketplace.atlassian.com. Needs internet access from the Jira server, and sends app keys there. ' +
+                'Only used when option 5 is ticked. Unticked = not included.')
+Boolean FORM_INCLUDE_MARKETPLACE
+
+@Checkbox(label = '8. Include: instance inventory',
+        description = 'Groups, issue types and statuses, schemes, field configurations and screens: counts for information. ' +
+                'Why you might add it: a complete record of the instance. Unticked = not included.')
+Boolean FORM_INCLUDE_INVENTORY
 
 // ╔══════════════════════════════════════════════════════════════════════╗
-// ║  PRESETS — what each Report depth runs                               ║
+// ║  WHAT RUNS — ScriptRunner only by default, the rest opt-in            ║
 // ╚══════════════════════════════════════════════════════════════════════╝
-// Cheap checks: API counts, safe on any size of instance.
-def CHEAP_CHECKS = [
-        'CHECK_01_SYSTEM_INFO', 'CHECK_02_USERS', 'CHECK_03_DIRECTORIES', 'CHECK_04_GROUPS',
-        'CHECK_05_PROJECTS', 'CHECK_06_ISSUES', 'CHECK_07_CONSTANTS', 'CHECK_08_WORKFLOWS',
-        'CHECK_09_WORKFLOW_SCHEMES', 'CHECK_10_PERMISSION_SCHEMES', 'CHECK_11_ISSUETYPE_SCHEMES',
-        'CHECK_12_FIELD_CONFIGS', 'CHECK_13_SCREENS', 'CHECK_14_CUSTOM_FIELDS', 'CHECK_15_APPS',
-        'CHECK_16_APP_LINKS', 'CHECK_17_1_TIMEZONE', 'CHECK_17_2_ISSUE_SECURITY',
-]
-def PRESETS = [
-        //            checks to run                                          user email scan  Marketplace lookup
-        QUICK   : [checks: CHEAP_CHECKS + ['CHECK_17_3_SCRIPTRUNNER_USAGE'], userScan: false, marketplace: false],
-        STANDARD: [checks: CHEAP_CHECKS + ['CHECK_17_3_SCRIPTRUNNER_USAGE'], userScan: true,  marketplace: false],
-        FULL    : [checks: CHEAP_CHECKS + ['CHECK_17_3_SCRIPTRUNNER_USAGE'], userScan: true,  marketplace: true],
-]
+// Every check, all off to start. ScriptRunner usage and the Jira version always run;
+// the "Include" boxes switch on their group's checks (see REPORT_GROUPS below).
+def config = [
+        CHECK_01_SYSTEM_INFO          : true,   // Jira version, build number, base URL (always: cheap, labels the report)
+        CHECK_02_USERS                : false,  // User counts (+ email checks with option 6)
+        CHECK_03_DIRECTORIES          : false,  // Internal vs external (LDAP/AD) directories
+        CHECK_04_GROUPS               : false,  // Total group count
+        CHECK_05_PROJECTS             : false,  // Project counts, types, categories, missing leads
+        CHECK_06_ISSUES               : false,  // Total issue count
+        CHECK_07_CONSTANTS            : false,  // Issue types, statuses, priorities, resolutions
+        CHECK_08_WORKFLOWS            : false,  // Workflow counts and unpublished drafts
+        CHECK_09_WORKFLOW_SCHEMES     : false,  // Workflow scheme counts and unused schemes
+        CHECK_10_PERMISSION_SCHEMES   : false,  // Permission scheme counts and unused schemes
+        CHECK_11_ISSUETYPE_SCHEMES    : false,  // Issue type scheme count
+        CHECK_12_FIELD_CONFIGS        : false,  // Field configuration scheme and layout counts
+        CHECK_13_SCREENS              : false,  // Screen count
+        CHECK_14_CUSTOM_FIELDS        : false,  // Custom field counts and breakdown by type
+        CHECK_15_APPS                 : false,  // Installed apps, grouped
+        CHECK_16_APP_LINKS            : false,  // Configured application links
+        CHECK_17_1_TIMEZONE           : false,  // JVM default timezone
+        CHECK_17_2_ISSUE_SECURITY     : false,  // Issue security schemes
+        CHECK_17_3_SCRIPTRUNNER_USAGE : true,   // ScriptRunner usage from RRD files (always)
+] as LinkedHashMap
+boolean USER_EMAIL_SCAN    = FORM_INCLUDE_READINESS && FORM_INCLUDE_USER_EMAILS
+boolean MARKETPLACE_LOOKUP = FORM_INCLUDE_READINESS && FORM_INCLUDE_MARKETPLACE
+boolean SUBOPTIONS_IGNORED = !FORM_INCLUDE_READINESS && (FORM_INCLUDE_USER_EMAILS || FORM_INCLUDE_MARKETPLACE)
 
-// ── CUSTOM — used only when Report depth = Custom ────────────────────────────
-def CUSTOM_CHECKS = [
-        CHECK_01_SYSTEM_INFO          : true,  // Jira version, build number, base URL
-        CHECK_02_USERS                : true,  // User counts (+ email checks if CUSTOM_USER_EMAIL_SCAN)
-        CHECK_03_DIRECTORIES          : true,  // Internal vs external (LDAP/AD) directories
-        CHECK_04_GROUPS               : true,  // Total group count
-        CHECK_05_PROJECTS             : true,  // Project counts, types, categories, missing leads
-        CHECK_06_ISSUES               : true,  // Total issue count
-        CHECK_07_CONSTANTS            : true,  // Issue types, statuses, priorities, resolutions
-        CHECK_08_WORKFLOWS            : true,  // Workflow counts and unpublished drafts
-        CHECK_09_WORKFLOW_SCHEMES     : true,  // Workflow scheme counts and unused schemes
-        CHECK_10_PERMISSION_SCHEMES   : true,  // Permission scheme counts and unused schemes
-        CHECK_11_ISSUETYPE_SCHEMES    : true,  // Issue type scheme count
-        CHECK_12_FIELD_CONFIGS        : true,  // Field configuration scheme and layout counts
-        CHECK_13_SCREENS              : true,  // Screen count
-        CHECK_14_CUSTOM_FIELDS        : true,  // Custom field counts and breakdown by type
-        CHECK_15_APPS                 : true,  // Installed apps, grouped
-        CHECK_16_APP_LINKS            : true,  // Configured application links
-        CHECK_17_1_TIMEZONE           : true,  // JVM default timezone
-        CHECK_17_2_ISSUE_SECURITY     : true,  // Issue security schemes
-        CHECK_17_3_SCRIPTRUNNER_USAGE : true,  // ScriptRunner usage from RRD files
-]
-def CUSTOM_USER_EMAIL_SCAN   = true   // loads every user into memory — slow on very large instances
-def CUSTOM_MARKETPLACE_LOOKUP = false  // outbound calls to marketplace.atlassian.com
-
-// ── Resolve the form + preset into the settings the script uses ──────────────
-String DEPTH = (FORM_DEPTH ?: 'QUICK').toUpperCase()
-def config
-boolean USER_EMAIL_SCAN
-boolean MARKETPLACE_LOOKUP
-if (DEPTH == 'CUSTOM') {
-    config             = new LinkedHashMap(CUSTOM_CHECKS)
-    USER_EMAIL_SCAN    = CUSTOM_USER_EMAIL_SCAN
-    MARKETPLACE_LOOKUP = CUSTOM_MARKETPLACE_LOOKUP
-} else {
-    def preset = PRESETS[DEPTH] ?: PRESETS.QUICK
-    config             = CUSTOM_CHECKS.collectEntries { k, v -> [k, (preset.checks as List).contains(k)] }
-    USER_EMAIL_SCAN    = preset.userScan as boolean
-    MARKETPLACE_LOOKUP = preset.marketplace as boolean
-}
 // ── Report groups, ordered by relevance to a ScriptRunner migration ─────────
 def REPORT_GROUPS = [
         SR       : [title: 'ScriptRunner',
@@ -201,13 +183,14 @@ def REPORT_GROUPS = [
                     checks: ['CHECK_01_SYSTEM_INFO', 'CHECK_04_GROUPS', 'CHECK_07_CONSTANTS', 'CHECK_09_WORKFLOW_SCHEMES',
                              'CHECK_10_PERMISSION_SCHEMES', 'CHECK_11_ISSUETYPE_SCHEMES', 'CHECK_12_FIELD_CONFIGS', 'CHECK_13_SCREENS']],
 ]
+// Groups not ticked are neither checked nor shown (the Jira version still runs, for the header).
 Set<String> hiddenGroups = [] as Set<String>
-if (FORM_HIDE_SR_CONTEXT) hiddenGroups << 'SR_CTX'
-if (FORM_HIDE_READINESS)  hiddenGroups << 'READINESS'
-if (FORM_HIDE_INVENTORY)  hiddenGroups << 'INVENTORY'
-hiddenGroups.each { String g -> (REPORT_GROUPS[g].checks as List).each { config[it] = false } }
+if (!FORM_INCLUDE_SR_CONTEXT) hiddenGroups << 'SR_CTX'
+if (!FORM_INCLUDE_READINESS)  hiddenGroups << 'READINESS'
+if (!FORM_INCLUDE_INVENTORY)  hiddenGroups << 'INVENTORY'
+REPORT_GROUPS.each { String g, Map grp -> if (!hiddenGroups.contains(g)) (grp.checks as List).each { config[it] = true } }
+String INCLUDED_LABEL = (['ScriptRunner'] + REPORT_GROUPS.findAll { k, v -> k != 'SR' && !hiddenGroups.contains(k) }.collect { k, v -> v.title as String }).join(' + ')
 
-int  TIME_BUDGET_SEC = (FORM_TIME_BUDGET && FORM_TIME_BUDGET > 0) ? FORM_TIME_BUDGET : 50
 def  SR_DORMANT_DAYS = (FORM_DORMANT_DAYS && FORM_DORMANT_DAYS > 0) ? FORM_DORMANT_DAYS : 90
 Map<String, String> SR_LISTENER_NAMES = [:]
 (FORM_LISTENER_NAMES ?: '').split(/[;\n]/).each { String pair ->
@@ -218,6 +201,18 @@ Map<String, String> SR_LISTENER_NAMES = [:]
 // ╔══════════════════════════════════════════════════════════════════════╗
 // ║  ADVANCED SETTINGS — most users never need to change these           ║
 // ╚══════════════════════════════════════════════════════════════════════╝
+// Safety limit for the user email check (option 6): above this many users it is skipped,
+// because it loads every user into memory. Raise only on purpose, and run off-peak.
+def USER_EMAIL_SCAN_MAX_USERS = 50_000
+
+// Upper limit for form option 1 (maximum run time). Not a Jira or ScriptRunner limit:
+// the report is returned in the same browser request, so it is lost once the browser,
+// proxy or load balancer stops waiting (often about 60 seconds), while the run keeps
+// using a Jira request thread. Raise only if you know your proxy waits longer.
+// Raising it also lengthens how long the one-run-at-a-time lock waits after a cut-short run.
+int  TIME_BUDGET_MAX_SEC = 300
+int  TIME_BUDGET_SEC = (FORM_TIME_BUDGET && FORM_TIME_BUDGET > 0) ? Math.min(FORM_TIME_BUDGET as int, TIME_BUDGET_MAX_SEC) : 50
+boolean TIME_BUDGET_CAPPED = FORM_TIME_BUDGET && FORM_TIME_BUDGET > TIME_BUDGET_MAX_SEC
 def MARKETPLACE_CHECK_MAX_APPS = 50   // cap on Marketplace lookups per run (each can take ~10s on timeout)
 
 // A plugin is treated as bundled if its key starts with one of these prefixes
@@ -260,6 +255,41 @@ def runCheck = { String key ->
     ran << key
     checkTimings << [key, System.currentTimeMillis()]
     return true
+}
+
+// ── One run at a time (per node) ─────────────────────────────────────────────
+// Closing or reloading the browser does NOT stop a run: it carries on on the server.
+// Clicking Run again would start a second run alongside it, doubling the load.
+// A JVM system property marks a run in progress on this node. It is not Jira data or
+// configuration, and it clears itself at the end of the run, or after the time below
+// if a run was cut short.
+final String RUN_LOCK_KEY = 'adaptavist.srMigrationReadiness.runningSince'
+final long   RUN_LOCK_MAX_AGE_MS = (TIME_BUDGET_MAX_SEC + 300) * 1000L   // the cap plus 5 minutes (10 minutes by default)
+String prevRunStart = System.getProperty(RUN_LOCK_KEY)
+if (prevRunStart?.isLong() && (RUN_START - prevRunStart.toLong()) < RUN_LOCK_MAX_AGE_MS) {
+    long waitMin = Math.max(1L, (long) Math.ceil((RUN_LOCK_MAX_AGE_MS - (RUN_START - prevRunStart.toLong())) / 60000d))
+    log.warn "Another run of this report is still in progress on this node (started ${new Date(prevRunStart.toLong())}). Not starting a second one."
+    return OutputFormatter.markupBuilder {
+        div(style: 'font-family:Arial,sans-serif;border:2px solid #FF8B00;background:#FFFAE6;border-radius:6px;padding:12px 16px;max-width:760px') {
+            div(style: 'font-size:15px;font-weight:bold;margin-bottom:6px') { mkp.yield 'Another run of this report is still in progress on this Jira node' }
+            p(style: 'margin:4px 0') { mkp.yield "It started at ${new Date(prevRunStart.toLong()).format('HH:mm:ss')}. To protect Jira, a second run was not started." }
+            ol(style: 'margin:4px 0;padding-left:20px') {
+                li { mkp.yield "Wait about ${waitMin} minute(s). An earlier run keeps going on the server even if its page was closed or timed out." }
+                li { mkp.yield 'Then click Run once. If the last run timed out, first set a lower time limit (option 1, e.g. 40) and untick every "Include" option.' }
+            }
+        }
+    }
+}
+System.setProperty(RUN_LOCK_KEY, RUN_START.toString())
+
+// ── Failed checks: recorded with a fix, the rest of the report still runs ────
+Map<String, String> checkErrors = [:]           // check key → error text
+Set<String> checkErrorsOom = [] as Set<String>  // checks that ran out of memory
+def checkFailed = { String key, Throwable e, boolean hideResults ->
+    checkErrors[key] = "${e.class.simpleName}: ${e.message ?: 'no message'}".toString()
+    if (e instanceof OutOfMemoryError) checkErrorsOom << key
+    if (hideResults) ran.remove(key)   // partial results are not shown
+    log.error("    ✖ ${key} failed: ${checkErrors[key]}", e)
 }
 // ══════════════════════════════════════════════════════════════════════════
 
@@ -325,7 +355,11 @@ Set<String> srNotReadKeys = [] as Set<String>   // RRD files skipped because the
 boolean srRrdUnavailable = false                 // RRD folder missing or unreadable
 boolean srBudgetHit = false
 List<String> srNodesMissing = []                 // cluster nodes Jira knows about with no usage folder
-if (runCheck('CHECK_17_3_SCRIPTRUNNER_USAGE')) {
+List<String> srNodesOffline = []                 // cluster nodes Jira lists as offline (not required to have a folder)
+Set<String> srUnreadableKeys = [] as Set<String> // usage files that exist but could not be read: usage unknown, never unused
+Set<String> srListCut = [] as Set<String>        // script lists cut short by the time limit
+boolean srFailed = false                         // the ScriptRunner check itself failed part-way
+if (runCheck('CHECK_17_3_SCRIPTRUNNER_USAGE')) { try {
     section('17.3', 'ScriptRunner Usage (RRD)')
 
     long nowSec        = (System.currentTimeMillis() / 1000L) as long
@@ -407,7 +441,8 @@ if (runCheck('CHECK_17_3_SCRIPTRUNNER_USAGE')) {
                     if (overBudget()) { srBudgetHit = true; srNotReadKeys << key; return }
                     srRrdFiles++
                     Map r = readRrd(f) as Map
-                    if (r == null) return
+                    // A file that exists but cannot be read means usage is unknown, not zero.
+                    if (r == null) { srUnreadableKeys << key; return }
                     Map ex = rrd[key]
                     // Nodes: days are combined (a day counts once, whichever node ran it).
                     rrd[key] = ex == null ? r : [
@@ -418,17 +453,31 @@ if (runCheck('CHECK_17_3_SCRIPTRUNNER_USAGE')) {
             }
             // Cluster check: every node Jira knows about should have a usage folder. If any is missing,
             // usage on that node is unknown, so no script is judged unused (see addRow).
+            // ScriptRunner cleans up node IDs before using them as folder names (SRJIRA-4961), so
+            // names are compared after removing everything except letters and digits.
+            // Offline nodes are not required to have a folder: any folder they left is still read.
             try {
                 def cm = ComponentAccessor.getComponent(com.atlassian.jira.cluster.ClusterManager)
                 if (cm?.isClustered()) {
-                    Set<String> folders = srNodeNames as Set<String>
-                    srNodesMissing = (cm.getAllNodes()?.collect { it.getNodeId() as String }?.findAll { it && !folders.contains(it) }?.sort() ?: []) as List<String>
+                    def normNode = { String n -> (n ?: '').toLowerCase(Locale.ENGLISH).replaceAll(/[^a-z0-9]/, '') }
+                    Set<String> folders = srNodeNames.collect { normNode(it as String) } as Set<String>
+                    def nodes = (cm.getAllNodes() ?: []) as Collection
+                    nodes.each { node ->
+                        String id = node?.getNodeId() as String
+                        if (!id) return
+                        String state = ''
+                        try { state = (node.getAt('state') ?: '').toString().toUpperCase(Locale.ENGLISH) } catch (ignored) {}
+                        if (state.contains('OFFLINE')) { srNodesOffline << id; return }
+                        if (!folders.contains(normNode(id))) srNodesMissing << id
+                    }
+                    srNodesMissing = srNodesMissing.sort()
                     if (srNodesMissing) srWarnings << "No usage folder found for cluster node(s): ${srNodesMissing.join(', ')}. Usage on those nodes is unknown, so no script is marked as unused. A node that has never run a script also has no folder.".toString()
                 }
             } catch (Exception e) {
                 srWarnings << "Could not check cluster nodes: ${e.message}. Compare \"Nodes read\" with Jira admin → System → Clustering.".toString()
             }
             if (srBudgetHit) srWarnings << "Time limit reached while reading usage files: ${srNotReadKeys.size()} file(s) were not read. Those scripts are shown as \"Not read\", never as unused. Re-run with a larger time limit.".toString()
+            if (srUnreadableKeys) srWarnings << "${srUnreadableKeys.size()} usage file(s) could not be read. Those scripts are shown as \"Not read\", never as unused.".toString()
             if (srMissingDs) srWarnings << "${srMissingDs.size()} usage file(s) had no 'count' data source and were skipped (e.g. ${srMissingDs.take(3).join(', ')}). The file format may differ on this ScriptRunner version.".toString()
             done("Nodes: ${srNodeNames.join(', ') ?: 'none'}  |  RRD files read: ${srRrdFiles}  |  Value type: ${srRrdMeta.dsType ?: 'n/a'}")
         }
@@ -445,7 +494,7 @@ if (runCheck('CHECK_17_3_SCRIPTRUNNER_USAGE')) {
         if (!tracked)               status = 'NOT TRACKED'
         // Any unread file for this script (e.g. one node read, another cut off by the time limit)
         // means usage is incomplete, so it is never judged unused.
-        else if (srRrdUnavailable || (key && srNotReadKeys.contains(key))) status = 'NOT READ'
+        else if (srRrdUnavailable || (key && (srNotReadKeys.contains(key) || srUnreadableKeys.contains(key)))) status = 'NOT READ'
         // No usage file and a file with no recorded run mean the same thing: no run found.
         else if (d == null || (d.last as long) == 0L) status = 'NEVER RUN'
         else if (Math.floorDiv((d.last as long) - 1L, DAY) > todayKey - (SR_DORMANT_DAYS as long)) status = 'ACTIVE'
@@ -483,12 +532,14 @@ if (runCheck('CHECK_17_3_SCRIPTRUNNER_USAGE')) {
     try {
         Map<String, List<String>> wfToProjects = [:]
         projectManager.getProjectObjects().each { Project proj ->
+            if (overBudget()) { srListCut << 'workflow scripts'; return }
             wfSchemeManager.getWorkflowMap(proj).values().toUnique().each { String wfName ->
                 wfToProjects.get(wfName, []) << proj.key
             }
         }
         Set<String> seen = [] as Set<String>
         workflowManager.getWorkflows().each { JiraWorkflow wf ->
+            if (overBudget()) { srListCut << 'workflow scripts'; return }
             List<String> keys = (wfToProjects[wf.name] ?: []).unique().sort()
             String where = keys ? keys.join(', ') : (wf.active ? 'No projects' : 'Workflow inactive')
             // Adds one ScriptRunner workflow item. Conditions are only marked as having usage
@@ -531,6 +582,7 @@ if (runCheck('CHECK_17_3_SCRIPTRUNNER_USAGE')) {
                     (tk.contains('onresolve') || tk.contains('scriptrunner')) && !tk.contains('jqlFunctions')
                 }
                 .each { cf ->
+                    if (overBudget()) { srListCut << 'script fields'; return }
                     cf.getConfigurationSchemes().each { scheme ->
                         String where = scheme.isGlobal() ? 'All projects (global)'
                                 : (scheme.getAssociatedProjectObjects()*.key.sort().join(', ') ?: 'No projects')
@@ -555,7 +607,8 @@ if (runCheck('CHECK_17_3_SCRIPTRUNNER_USAGE')) {
     // Everything left on disk: REST endpoints, JQL functions, listeners, deleted scripts
     String UUID_RE = /[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/
     String REST_RE = /(?i)(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)-.+/
-    (rrd.keySet() - attributed).sort().each { String k ->
+    // Files that exist but were not read (time limit, unreadable) are listed too, as "Not read".
+    ((rrd.keySet() + srNotReadKeys + srUnreadableKeys) - attributed).sort().each { String k ->
         if (k ==~ REST_RE) {
             addRow('REST Endpoint', k, 'Not project-scoped', k, true)
         } else if (k ==~ UUID_RE) {
@@ -568,12 +621,20 @@ if (runCheck('CHECK_17_3_SCRIPTRUNNER_USAGE')) {
         }
     }
 
+    if (srListCut) srWarnings << "Time limit reached while listing ${srListCut.join(' and ')}: some are not listed. Their usage files show under \"Identify\", never as unused.".toString()
     def byStatus = srRows.countBy { it.status }
     done("Scripts: ${srRows.size()}  |  " + ['ACTIVE', 'DORMANT', 'NEVER RUN', 'NO DATA', 'NOT TRACKED']
             .collect { "${it}: ${byStatus[it] ?: 0}" }.join('  |  '))
     srWarnings.each { warn(it) }
-    srRows.each { Map r -> log.info "    [SR] ${r.status} | ${r.type} | ${r.name} | days ran ${SR_DORMANT_DAYS}d ${r.dX} | 30d ${r.d30} | 90d ${r.d90} | last ${r.lastRun}${r.daysAgo != null ? " (${r.daysAgo} days ago)" : ''}" }
-} else { skipped('17.3', 'ScriptRunner Usage (RRD)') }
+    srRows.take(200).each { Map r -> log.info "    [SR] ${r.status} | ${r.type} | ${r.name} | days ran ${SR_DORMANT_DAYS}d ${r.dX} | 30d ${r.d30} | 90d ${r.d90} | last ${r.lastRun}${r.daysAgo != null ? " (${r.daysAgo} days ago)" : ''}" }
+    if (srRows.size() > 200) log.info "    [SR] …and ${srRows.size() - 200} more (log capped at 200 lines; every script is in the report)"
+} catch (Throwable e) {
+    // Fail safe: rows built before the failure keep their status only if it is "in use".
+    // Anything that would read as unused becomes "Not read".
+    checkFailed('CHECK_17_3_SCRIPTRUNNER_USAGE', e, false)
+    srFailed = true
+    srRows.each { Map r -> if (r.status in ['DORMANT', 'NEVER RUN']) r.status = 'NOT READ' }
+} } else { skipped('17.3', 'ScriptRunner Usage (RRD)') }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // PART 1 — INSTANCE INVENTORY (checks 1–16)
@@ -583,13 +644,13 @@ if (runCheck('CHECK_17_3_SCRIPTRUNNER_USAGE')) {
 def jiraVersion = '(skipped)'
 def buildNumber = '(skipped)'
 def baseUrl     = '(skipped)'
-if (runCheck('CHECK_01_SYSTEM_INFO')) {
+if (runCheck('CHECK_01_SYSTEM_INFO')) { try {
     section('01', 'System Information')
     jiraVersion = buildInfo.version
     buildNumber = buildInfo.currentBuildNumber
     baseUrl     = appProps.getString('jira.baseurl') ?: appProps.jiraBaseUrl
     done("Version: ${jiraVersion}  |  Build: ${buildNumber}  |  URL: ${baseUrl}")
-} else { skipped('01', 'System Information') }
+} catch (Throwable e) { checkFailed('CHECK_01_SYSTEM_INFO', e, true) } } else { skipped('01', 'System Information') }
 
 // 2. Users
 def totalUsers       = 0
@@ -598,10 +659,19 @@ def inactiveUsers    = 0
 def usersWithNoEmail = [] as List<ApplicationUser>
 def duplicateEmails  = [:] as Map
 boolean userScanRan = false
-if (runCheck('CHECK_02_USERS')) {
+String userScanSkipReason = null
+if (runCheck('CHECK_02_USERS')) { try {
     section('02', 'Users')
     totalUsers = userManager.getTotalUserCount()
-    if (USER_EMAIL_SCAN && !overBudget()) {
+    // Safety: the email check loads every user into memory, so it is skipped above
+    // USER_EMAIL_SCAN_MAX_USERS (advanced settings).
+    if (USER_EMAIL_SCAN && totalUsers > (USER_EMAIL_SCAN_MAX_USERS as long)) {
+        userScanSkipReason = "Email checks were skipped to protect Jira: ${String.format('%,d', totalUsers as long)} users is above the ${String.format('%,d', USER_EMAIL_SCAN_MAX_USERS as long)} safe limit (the check loads every user into memory). To run it anyway, raise USER_EMAIL_SCAN_MAX_USERS in the script's advanced settings and run off-peak.".toString()
+        warn(userScanSkipReason)
+    } else if (USER_EMAIL_SCAN && overBudget()) {
+        userScanSkipReason = 'Email checks were skipped because the time limit was reached.'
+    }
+    if (USER_EMAIL_SCAN && !userScanSkipReason) {
         progress("Total users: ${totalUsers} — loading full user list for email checks (slow on very large instances)...")
         @SuppressWarnings('deprecation')
         def allUsers  = userManager.getAllApplicationUsers() as List<ApplicationUser>
@@ -615,28 +685,28 @@ if (runCheck('CHECK_02_USERS')) {
         userScanRan = true
         done("Active: ${activeUsers}  |  Inactive: ${inactiveUsers}  |  No email: ${usersWithNoEmail.size()}  |  Duplicate email groups: ${duplicateEmails.size()}")
     } else {
-        done("Total users: ${totalUsers} (email checks not run at this report depth or time budget reached)")
+        done("Total users: ${totalUsers} (email checks not included, or skipped)")
     }
-} else { skipped('02', 'Users') }
+} catch (Throwable e) { checkFailed('CHECK_02_USERS', e, true) } } else { skipped('02', 'Users') }
 
 // 3. User directories
 def allDirectories = [] as List<Directory>
 def externalDirs   = [] as List<Directory>
-if (runCheck('CHECK_03_DIRECTORIES')) {
+if (runCheck('CHECK_03_DIRECTORIES')) { try {
     section('03', 'User Directories')
     allDirectories = directoryManager.findAllDirectories()
     externalDirs   = allDirectories.findAll { it.type?.toString() != 'INTERNAL' }
     done("Total: ${allDirectories.size()}  |  External: ${externalDirs.size()}")
     externalDirs.each { Directory d -> warn("External directory: [${d.type}] ${d.name}") }
-} else { skipped('03', 'User Directories') }
+} catch (Throwable e) { checkFailed('CHECK_03_DIRECTORIES', e, true) } } else { skipped('03', 'User Directories') }
 
 // 4. Groups
 def allGroupNames = [] as Collection<String>
-if (runCheck('CHECK_04_GROUPS')) {
+if (runCheck('CHECK_04_GROUPS')) { try {
     section('04', 'Groups')
     allGroupNames = groupManager.getAllGroupNames()
     done("Total groups: ${allGroupNames.size()}")
-} else { skipped('04', 'Groups') }
+} catch (Throwable e) { checkFailed('CHECK_04_GROUPS', e, true) } } else { skipped('04', 'Groups') }
 
 // 5. Projects
 def allProjects        = [] as List<Project>
@@ -645,7 +715,7 @@ def projectsByType     = [:] as Map
 def projectsNoLead     = [] as List<Project>
 def projectCategories  = [] as Collection
 def projectsNoCategory = [] as Collection<Project>
-if (runCheck('CHECK_05_PROJECTS')) {
+if (runCheck('CHECK_05_PROJECTS')) { try {
     section('05', 'Projects')
     allProjects        = projectManager.getProjectObjects()
     archivedProjects   = projectManager.getArchivedProjects()
@@ -654,15 +724,15 @@ if (runCheck('CHECK_05_PROJECTS')) {
     projectCategories  = projectManager.getAllProjectCategories()
     projectsNoCategory = projectManager.getProjectObjectsWithNoCategory()
     done("Active: ${allProjects.size()}  |  Archived: ${archivedProjects.size()}  |  No lead: ${projectsNoLead.size()}")
-} else { skipped('05', 'Projects') }
+} catch (Throwable e) { checkFailed('CHECK_05_PROJECTS', e, true) } } else { skipped('05', 'Projects') }
 
 // 6. Issues
 def totalIssues = 0L
-if (runCheck('CHECK_06_ISSUES')) {
+if (runCheck('CHECK_06_ISSUES')) { try {
     section('06', 'Issues')
     totalIssues = issueManager.getIssueCount()
     done("Total issues: ${totalIssues}")
-} else { skipped('06', 'Issues') }
+} catch (Throwable e) { checkFailed('CHECK_06_ISSUES', e, true) } } else { skipped('06', 'Issues') }
 
 // 7. Issue types, statuses, priorities, resolutions
 def issueTypes  = [] as Collection
@@ -670,7 +740,7 @@ def subTasks    = [] as Collection
 def statuses    = [] as Collection
 def priorities  = [] as Collection
 def resolutions = [] as Collection
-if (runCheck('CHECK_07_CONSTANTS')) {
+if (runCheck('CHECK_07_CONSTANTS')) { try {
     section('07', 'Issue Types, Statuses, Priorities & Resolutions')
     issueTypes  = constantsManager.getAllIssueTypeObjects()
     subTasks    = constantsManager.getSubTaskIssueTypeObjects()
@@ -678,70 +748,70 @@ if (runCheck('CHECK_07_CONSTANTS')) {
     priorities  = constantsManager.getPriorities()
     resolutions = constantsManager.getResolutions()
     done("Issue types: ${issueTypes.size()}  |  Statuses: ${statuses.size()}  |  Priorities: ${priorities.size()}  |  Resolutions: ${resolutions.size()}")
-} else { skipped('07', 'Issue Types, Statuses, Priorities & Resolutions') }
+} catch (Throwable e) { checkFailed('CHECK_07_CONSTANTS', e, true) } } else { skipped('07', 'Issue Types, Statuses, Priorities & Resolutions') }
 
 // 8. Workflows
 def allWorkflows       = [] as List<JiraWorkflow>
 def activeWorkflows    = [] as List<JiraWorkflow>
 def workflowsWithDraft = [] as List<JiraWorkflow>
-if (runCheck('CHECK_08_WORKFLOWS')) {
+if (runCheck('CHECK_08_WORKFLOWS')) { try {
     section('08', 'Workflows')
     allWorkflows       = workflowManager.getWorkflows() as List<JiraWorkflow>
     activeWorkflows    = workflowManager.getActiveWorkflows() as List<JiraWorkflow>
     workflowsWithDraft = allWorkflows.findAll { it.hasDraftWorkflow() } as List<JiraWorkflow>
     done("Total: ${allWorkflows.size()}  |  Active: ${activeWorkflows.size()}  |  With drafts: ${workflowsWithDraft.size()}")
-} else { skipped('08', 'Workflows') }
+} catch (Throwable e) { checkFailed('CHECK_08_WORKFLOWS', e, true) } } else { skipped('08', 'Workflows') }
 
 // 9. Workflow schemes
 def allWfSchemes        = [] as List
 def unassignedWfSchemes = [] as List
-if (runCheck('CHECK_09_WORKFLOW_SCHEMES')) {
+if (runCheck('CHECK_09_WORKFLOW_SCHEMES')) { try {
     section('09', 'Workflow Schemes')
     allWfSchemes        = wfSchemeManager.getAssignableSchemes().toList()
     unassignedWfSchemes = allWfSchemes.findAll { wfSchemeManager.getProjectsUsing(it).isEmpty() }
     done("Total: ${allWfSchemes.size()}  |  Unassigned: ${unassignedWfSchemes.size()}")
-} else { skipped('09', 'Workflow Schemes') }
+} catch (Throwable e) { checkFailed('CHECK_09_WORKFLOW_SCHEMES', e, true) } } else { skipped('09', 'Workflow Schemes') }
 
 // 10. Permission schemes
 def allPermSchemes        = [] as List
 def unassignedPermSchemes = [] as List
-if (runCheck('CHECK_10_PERMISSION_SCHEMES')) {
+if (runCheck('CHECK_10_PERMISSION_SCHEMES')) { try {
     section('10', 'Permission Schemes')
     allPermSchemes        = permSchemeManager.getSchemeObjects().toList()
     unassignedPermSchemes = permSchemeManager.getUnassociatedSchemes().toList()
     done("Total: ${allPermSchemes.size()}  |  Unassigned: ${unassignedPermSchemes.size()}")
-} else { skipped('10', 'Permission Schemes') }
+} catch (Throwable e) { checkFailed('CHECK_10_PERMISSION_SCHEMES', e, true) } } else { skipped('10', 'Permission Schemes') }
 
 // 11. Issue type schemes
 def allIssueTypeSchemes = [] as List
-if (runCheck('CHECK_11_ISSUETYPE_SCHEMES')) {
+if (runCheck('CHECK_11_ISSUETYPE_SCHEMES')) { try {
     section('11', 'Issue Type Schemes')
     allIssueTypeSchemes = issueTypeSchemeManager.getAllSchemes().toList()
     done("Total: ${allIssueTypeSchemes.size()}")
-} else { skipped('11', 'Issue Type Schemes') }
+} catch (Throwable e) { checkFailed('CHECK_11_ISSUETYPE_SCHEMES', e, true) } } else { skipped('11', 'Issue Type Schemes') }
 
 // 12. Field configurations
 def allFieldLayoutSchemes = [] as List
 def allFieldLayouts       = [] as List
-if (runCheck('CHECK_12_FIELD_CONFIGS')) {
+if (runCheck('CHECK_12_FIELD_CONFIGS')) { try {
     section('12', 'Field Configurations')
     allFieldLayoutSchemes = fieldLayoutManager.getFieldLayoutSchemes().toList()
     allFieldLayouts       = fieldLayoutManager.getEditableFieldLayouts().toList()
     done("Schemes: ${allFieldLayoutSchemes.size()}  |  Configurations: ${allFieldLayouts.size()}")
-} else { skipped('12', 'Field Configurations') }
+} catch (Throwable e) { checkFailed('CHECK_12_FIELD_CONFIGS', e, true) } } else { skipped('12', 'Field Configurations') }
 
 // 13. Screens
 def allScreens = [] as Collection
-if (runCheck('CHECK_13_SCREENS')) {
+if (runCheck('CHECK_13_SCREENS')) { try {
     section('13', 'Screens')
     allScreens = fieldScreenManager.getFieldScreens()
     done("Total: ${allScreens.size()}")
-} else { skipped('13', 'Screens') }
+} catch (Throwable e) { checkFailed('CHECK_13_SCREENS', e, true) } } else { skipped('13', 'Screens') }
 
 // 14. Custom fields
 def allCustomFields = [] as List<CustomField>
 def cfByType        = [:] as Map
-if (runCheck('CHECK_14_CUSTOM_FIELDS')) {
+if (runCheck('CHECK_14_CUSTOM_FIELDS')) { try {
     section('14', 'Custom Fields')
     allCustomFields = fieldManager.getOrderableFields()
             .findAll { fieldManager.isCustomField(it) }
@@ -749,7 +819,7 @@ if (runCheck('CHECK_14_CUSTOM_FIELDS')) {
             .findAll { it != null } as List<CustomField>
     cfByType = allCustomFields.groupBy { it.customFieldType?.key ?: 'unknown' }
     done("Total: ${allCustomFields.size()}")
-} else { skipped('14', 'Custom Fields') }
+} catch (Throwable e) { checkFailed('CHECK_14_CUSTOM_FIELDS', e, true) } } else { skipped('14', 'Custom Fields') }
 
 // 15. Installed apps
 //   1. Language packs   2. Bundled Atlassian apps
@@ -760,7 +830,7 @@ def corePlugins         = [] as List<Plugin>
 def marketplacePlugins  = []  // [plugin, latestVersion, versionMatches]
 def unidentifiedPlugins = []  // looked up, NOT found on the Marketplace: [plugin, checkResult, noVendorInfo]
 def notCheckedPlugins   = []  // not looked up (lookup off, limit, time budget) or lookup failed: [plugin, checkResult, noVendorInfo]
-if (runCheck('CHECK_15_APPS')) {
+if (runCheck('CHECK_15_APPS')) { try {
     section('15', 'Installed Apps')
     def nonSystem = pluginAccessor.getEnabledPlugins()
             .findAll { Plugin p -> !pluginAccessor.isSystemPlugin(p.key) } as List<Plugin>
@@ -819,15 +889,15 @@ if (runCheck('CHECK_15_APPS')) {
         }
     }
     done("Confirmed on Marketplace: ${marketplacePlugins.size()}  |  Not found: ${unidentifiedPlugins.size()}  |  Not checked: ${notCheckedPlugins.size()}")
-} else { skipped('15', 'Installed Apps') }
+} catch (Throwable e) { checkFailed('CHECK_15_APPS', e, true) } } else { skipped('15', 'Installed Apps') }
 
 // 16. Application links
 def appLinks = [] as List<ApplicationLink>
-if (runCheck('CHECK_16_APP_LINKS')) {
+if (runCheck('CHECK_16_APP_LINKS')) { try {
     section('16', 'Application Links')
     appLinks = (appLinkService?.getApplicationLinks()?.toList() ?: []) as List<ApplicationLink>
     done("Total: ${appLinks.size()}")
-} else { skipped('16', 'Application Links') }
+} catch (Throwable e) { checkFailed('CHECK_16_APP_LINKS', e, true) } } else { skipped('16', 'Application Links') }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // PART 2 — ADAPTAVIST CHECKS (check 17)
@@ -843,22 +913,22 @@ boolean tempoInstalled = (pluginAccessor.getEnabledPlugins() as List<Plugin>).an
 // 17.1 System timezone
 def systemTimezoneId      = '(skipped)'
 def systemTimezoneDisplay = '(skipped)'
-if (runCheck('CHECK_17_1_TIMEZONE')) {
+if (runCheck('CHECK_17_1_TIMEZONE')) { try {
     section('17.1', 'System Timezone')
     def tz = TimeZone.getDefault()
     systemTimezoneId      = tz.ID
     systemTimezoneDisplay = tz.getDisplayName(Locale.ENGLISH)
     done("Timezone: ${systemTimezoneId} (${systemTimezoneDisplay})${tempoInstalled ? '  |  Tempo Timesheets detected' : ''}")
-} else { skipped('17.1', 'System Timezone') }
+} catch (Throwable e) { checkFailed('CHECK_17_1_TIMEZONE', e, true) } } else { skipped('17.1', 'System Timezone') }
 
 // 17.2 Issue security schemes
 def securitySchemeNames = [] as List<String>
-if (runCheck('CHECK_17_2_ISSUE_SECURITY')) {
+if (runCheck('CHECK_17_2_ISSUE_SECURITY')) { try {
     section('17.2', 'Issue Security Schemes')
     securitySchemeNames = (issueSecMgr.getSchemeObjects()?.toList() ?: [])
             .collect { s -> (s?.name ?: '(unnamed)') as String } as List<String>
     done("Total: ${securitySchemeNames.size()}")
-} else { skipped('17.2', 'Issue Security Schemes') }
+} catch (Throwable e) { checkFailed('CHECK_17_2_ISSUE_SECURITY', e, true) } } else { skipped('17.2', 'Issue Security Schemes') }
 
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -879,7 +949,7 @@ def SECTION_INFO = [
                      what : 'The Jira version, build number and base URL.',
                      why  : 'Identifies exactly which instance and version this report describes, so it can be matched to the right migration plan.'],
         'sec-2'   : [title: 'Users', check: 'CHECK_02_USERS',
-                     what : 'How many users there are. At Standard or Full: active and inactive users, and users with a missing or shared email address.',
+                     what : 'How many users there are. With option 6: active and inactive users, and users with a missing or shared email address.',
                      why  : 'Atlassian Cloud identifies people by email address, so missing or shared emails need sorting out before users are moved.'],
         'sec-3'   : [title: 'User directories', check: 'CHECK_03_DIRECTORIES',
                      what : 'Where users come from: Jira\'s own internal directory, or external ones such as LDAP or Active Directory.',
@@ -958,7 +1028,8 @@ if (ran.contains('CHECK_01_SYSTEM_INFO'))
     setLight('sec-1', buildInfo.isFinal() ? 'INFO' : 'AMBER',
             "Jira ${jiraVersion} (build ${buildNumber})${buildInfo.isFinal() ? '.' : ' — not a final release.'}".toString())
 if (ran.contains('CHECK_02_USERS')) {
-    if (!userScanRan) setLight('sec-2', 'INFO', "${fmtN(totalUsers)} users. Email checks not run at this depth (use Standard or Full).".toString())
+    if (!userScanRan) setLight('sec-2', totalUsers > THRESHOLD_LARGE_USERS ? 'AMBER' : 'INFO', "${fmtN(totalUsers)} users. " +
+            (userScanSkipReason ?: 'Email checks not included (tick option 6 to add them).'))
     else if (usersWithNoEmail || duplicateEmails)
         setLight('sec-2', 'RED', "${fmtN(totalUsers)} users: ${usersWithNoEmail.size()} with no email, ${duplicateEmails.size()} email address(es) shared by more than one user.".toString())
     else setLight('sec-2', totalUsers > THRESHOLD_LARGE_USERS ? 'AMBER' : 'GREEN',
@@ -1005,7 +1076,7 @@ if (ran.contains('CHECK_15_APPS')) {
             : ("${third} third-party app(s): " +
                (MARKETPLACE_LOOKUP ? "${unidentifiedPlugins.size()} not found on the Marketplace, ${marketplacePlugins.size()} found" +
                        (notCheckedPlugins ? ", ${notCheckedPlugins.size()} not checked" : '') + '. '
-                                   : 'not looked up on the Marketplace at this depth (Full adds this). ') +
+                                   : 'not looked up on the Marketplace (tick option 7 to add this). ') +
                'Confirm a Cloud equivalent for each.') as String
     // RED only for apps actually looked up and not found. "Not checked" is never RED.
     setLight('sec-15', unidentifiedPlugins ? 'RED' : (third ? 'AMBER' : 'GREEN'), appsFinding)
@@ -1023,14 +1094,15 @@ if (ran.contains('CHECK_17_3_SCRIPTRUNNER_USAGE')) {
     int inUse  = srCountScripts(['ACTIVE'])
     setLight('sec-17-3', (inUse || retire || srUnattributed) ? 'AMBER' : 'GREEN',
             !srRows ? 'No ScriptRunner scripts found.'
-                    : "${inUse} in use, ${retire} not run recently (worth considering for retirement)" +
+                    : "${inUse} to keep (in use), ${retire} to archive or delete if the owner agrees (no run recently)" +
                     (srUnattributed ? ", ${srUnattributed} not matched to a script." : '.') +
-                    (srBudgetHit ? ' Incomplete — time budget reached.' : ''))
+                    ((srBudgetHit || srListCut || srFailed) ? ' Incomplete — see Problems in this run.' : ''))
 }
 SECTION_INFO.each { String id, Map info ->
+    if (!summaries[id] && checkErrors.containsKey(info.check)) setLight(id, 'GREY', 'Check failed — see Problems in this run at the top.')
     if (!summaries[id]) setLight(id, 'GREY', timeSkipped.contains(info.check)
             ? "Not run — the ${TIME_BUDGET_SEC}s time limit was reached first.".toString()
-            : 'Not run at this report depth.')
+            : 'Not included in this run.')
 }
 int redCount   = summaries.count { k, v -> v.light == 'RED' } as int
 int amberCount = summaries.count { k, v -> v.light == 'AMBER' } as int
@@ -1094,17 +1166,23 @@ def srGroupOf = { Map r ->
     return 'NODATA'
 }
 String SR_DAYS_TXT = (SR_DORMANT_DAYS as int) == 1 ? '1 day' : "${SR_DORMANT_DAYS} days".toString()
+// Decision first: Keep, Archive or delete, or Check first. Every script is in exactly one group.
 List<Map> SR_GROUPS = [
-        [key: 'RETIRE', word: 'CONSIDER', colour: '#FF8B00', text: '#172B4D', title: 'Consider retiring before converting',
-         explain: "No run recorded in the last ${SR_DAYS_TXT}. Consider whether each one is still needed. If not, consider deleting it, or disabling it to keep a copy, on Data Center before exporting — so only scripts that are wanted get converted.".toString()],
-        [key: 'IDENTIFY', word: 'IDENTIFY', colour: '#6554C0', text: '#FFFFFF', title: 'Not matched to a script — identify these',
-         explain: 'Usage files that match no configured script. They can be listeners (name them with form option 4), other ScriptRunner features, or scripts that were deleted. Identify them before deciding anything.'],
-        [key: 'INUSE', word: 'IN USE', colour: '#00875A', text: '#FFFFFF', title: 'In use',
-         explain: 'These scripts appear to be actively used.'],
-        [key: 'NOTREAD', word: 'NOT READ', colour: '#DFE1E6', text: '#172B4D', title: 'Not read — usage unknown',
-         explain: 'Usage could not be read (the time limit was reached, the usage files were unavailable, or a cluster node had no usage folder). These are not marked as unused. See the note above the groups.'],
-        [key: 'NODATA', word: 'NO DATA', colour: '#DFE1E6', text: '#172B4D', title: 'No usage data',
-         explain: 'A type ScriptRunner does not record usage for (e.g. Behaviours), or a workflow condition with no recorded run (it is not confirmed that ScriptRunner records conditions). Usage is unknown, not zero. Check with the owner whether it is still needed.'],
+        [key: 'RETIRE', decision: 'ARCHIVE', word: 'ARCHIVE / DELETE', colour: '#FF8B00', text: '#172B4D', title: 'Archive or delete (after the owner agrees)',
+         action: 'Archive or delete if the owner agrees',
+         explain: "No run recorded in the last ${SR_DAYS_TXT}. If the owner agrees it is no longer needed, archive it (disable it, which keeps a copy) or delete it, on Data Center, before the Script Registry export.".toString()],
+        [key: 'INUSE', decision: 'KEEP', word: 'KEEP', colour: '#00875A', text: '#FFFFFF', title: 'Keep (in use)',
+         action: 'Keep',
+         explain: "Ran at least once in the last ${SR_DAYS_TXT}. Keep it. ScriptRunner Migration Suite Analyse and Assess decides how it moves to Cloud.".toString()],
+        [key: 'IDENTIFY', decision: 'CHECK', word: 'IDENTIFY', colour: '#6554C0', text: '#FFFFFF', title: 'Check first: identify these',
+         action: 'Check first: identify what this is',
+         explain: 'Usage files that match no configured script: listeners (name them with form option 3), other ScriptRunner features, or deleted scripts. Identify them before deciding anything.'],
+        [key: 'NOTREAD', decision: 'CHECK', word: 'NOT READ', colour: '#DFE1E6', text: '#172B4D', title: 'Check first: usage not read',
+         action: 'Check first: fix the problem shown and re-run',
+         explain: 'Usage could not be read, so it is unknown, not zero. See Problems in this run at the top for the fix, then re-run.'],
+        [key: 'NODATA', decision: 'CHECK', word: 'NO DATA', colour: '#DFE1E6', text: '#172B4D', title: 'Check first: no usage data',
+         action: 'Check first: ask the owner',
+         explain: 'A type ScriptRunner does not record usage for (e.g. Behaviours), or a workflow condition with no recorded run. Usage is unknown, not zero. Ask the owner whether it is still needed.'],
 ]
 Map<String, List<Map>> srRowsByGroup = SR_GROUPS.collectEntries { [(it.key): []] }
 srRows.each { Map r -> srRowsByGroup[srGroupOf(r)] << r }
@@ -1124,6 +1202,45 @@ Map<String, String> SR_ADMIN_PATHS = [
         'Not matched to a configured script': '/plugins/servlet/scriptrunner/admin/listeners',
 ]
 String srBase = ((appProps.getString('jira.baseurl') ?: appProps.jiraBaseUrl) ?: '').replaceAll('/+$', '')
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PROBLEMS IN THIS RUN — each with a plain fix, shown at the top of the report
+// ═══════════════════════════════════════════════════════════════════════════
+List<Map> problems = []   // [level: 'error'|'warn'|'info', what, fix]
+String RERUN_LIGHT = 'Re-run with every "Include" option unticked (ScriptRunner only), off-peak.'
+checkErrors.each { String key, String err ->
+    String title = SECTION_INFO.find { k, v -> v.check == key }?.value?.title ?: key
+    if (checkErrorsOom.contains(key)) {
+        problems << [level: 'error', what: "${title}: the Jira server ran low on memory during this check (${err}).".toString(),
+                     fix: "${RERUN_LIGHT} If it happens again, do not re-run: send this report and the Jira log to your Adaptavist contact.".toString()]
+    } else {
+        problems << [level: 'error', what: "${title}: this check failed (${err}).".toString(),
+                     fix: key == 'CHECK_17_3_SCRIPTRUNNER_USAGE'
+                             ? 'Re-run once. If it fails again, send this error text to your Adaptavist contact. Scripts that would have looked unused are shown as "Not read", so nothing is wrongly marked for archiving.'
+                             : 'Re-run once. If it fails again, untick the "Include" option for that area and send this error text to your Adaptavist contact.']
+    }
+}
+if (srRrdUnavailable && !srFailed) problems << [level: 'error', what: 'ScriptRunner usage files were not found or could not be opened, so no usage is shown.',
+        fix: 'Check that ScriptRunner is installed, enabled, and has run scripts. On a cluster, ask your Jira administrator to check that the shared home is mounted on this node.']
+if (srNodesMissing) problems << [level: 'warn', what: "No usage folder was found for cluster node(s) ${srNodesMissing.join(', ')}, so no script is marked as unused.".toString(),
+        fix: 'Ask your Jira administrator to check those nodes in Jira admin → System → Clustering. A node that is new, or has never run a script, has no folder yet: re-run once it has. A node removed for good should be removed from the cluster list.']
+if (srBudgetHit || srListCut || timeSkipped) problems << [level: 'warn',
+        what: ([srBudgetHit ? "${srNotReadKeys.size()} usage file(s) not read" : null,
+                srListCut ? "some ${srListCut.join(' and ')} not listed" : null,
+                timeSkipped ? "${timeSkipped.size()} area(s) not checked" : null].findAll().join(', ') + " — the ${TIME_BUDGET_SEC}s time limit was reached.").toString(),
+        fix: "Raise the time limit (option 1, up to ${TIME_BUDGET_MAX_SEC}s), or untick the \"Include\" options to check ScriptRunner only, and re-run.".toString()]
+if (srUnreadableKeys) problems << [level: 'warn', what: "${srUnreadableKeys.size()} usage file(s) could not be read. Those scripts show as \"Not read\".".toString(),
+        fix: 'Usually a file being written at that moment: re-run. If the same files fail again, send the Jira log to your Adaptavist contact.']
+if (srMissingDs) problems << [level: 'warn', what: "${srMissingDs.size()} usage file(s) were in an unexpected format and were skipped.".toString(),
+        fix: "This ScriptRunner version (${srVersion}) may store usage differently. Send this report to your Adaptavist contact.".toString()]
+int mpFailed = (notCheckedPlugins.count { (it as Map).checkResult?.toString()?.startsWith('LOOKUP FAILED') } ?: 0) as int
+if (MARKETPLACE_LOOKUP && mpFailed) problems << [level: 'warn', what: "${mpFailed} app lookup(s) on the Atlassian Marketplace failed.".toString(),
+        fix: 'The Jira server may not reach marketplace.atlassian.com. Ask your Jira administrator about outbound internet or proxy access, or untick option 7.']
+if (TIME_BUDGET_CAPPED) problems << [level: 'info', what: "The time limit asked for was above ${TIME_BUDGET_MAX_SEC}s, so ${TIME_BUDGET_MAX_SEC}s was used.".toString(),
+        fix: 'The browser usually gives up long before that, losing the report. If your proxy waits longer, raise TIME_BUDGET_MAX_SEC in the script\'s advanced settings. Otherwise check ScriptRunner only (untick the "Include" options).']
+if (SUBOPTIONS_IGNORED) problems << [level: 'info', what: 'Option 6 or 7 was ticked without option 5, so it was not used.',
+        fix: 'Tick option 5 as well to include user email checks or Marketplace lookups.']
+if (userScanSkipReason) problems << [level: 'info', what: userScanSkipReason, fix: 'Nothing to fix. The ScriptRunner results are not affected.']
 
 // ═══════════════════════════════════════════════════════════════════════════
 // HTML REPORT
@@ -1146,7 +1263,9 @@ String H3  = 'color:#172B4D;margin-top:20px'
 String DIM = 'color:#5E6C84;font-size:12px'
 String BOX_WARN = 'background:#FFFAE6;border-left:4px solid #FF8B00;padding:8px 12px;margin:12px 0;font-size:12px'
 
-OutputFormatter.markupBuilder { builder ->
+def reportHtml
+try {
+reportHtml = OutputFormatter.markupBuilder { builder ->
     // ── One visual rule for "clickable" ──────────────────────────────────────
     //   blue ▸ / ▾ = the line opens and closes (click anywhere on it)
     //   blue underlined text with ↗ = a real link (opens in a new tab)
@@ -1155,24 +1274,32 @@ OutputFormatter.markupBuilder { builder ->
 .mri { font-family: Arial, sans-serif; max-width: 1100px; margin: 0 auto; color: #172B4D; }
 .mri a.mri-link { color: #0052CC; text-decoration: underline; }
 .mri a.mri-link::after { content: ' \\2197'; font-size: 10px; }
-.mri details > summary { cursor: pointer; list-style: none; }
+.mri details > summary { cursor: pointer; list-style: none; position: relative; padding-right: 120px !important; background: #F4F8FF; border-radius: 4px; }
 .mri details > summary::-webkit-details-marker { display: none; }
-.mri details > summary::before { content: '\\25B8'; display: inline-block; width: 16px; color: #0052CC; font-weight: bold; }
-.mri details[open] > summary::before { content: '\\25BE'; }
+.mri details > summary::before { content: '\\25B6'; display: inline-block; width: 20px; color: #0052CC; font-size: 12px; font-weight: bold; }
+.mri details[open] > summary::before { content: '\\25BC'; }
+.mri details > summary::after { content: 'Click to open'; position: absolute; right: 10px; top: 50%; transform: translateY(-50%);
+  font-size: 11px; font-weight: bold; color: #FFFFFF; background: #0052CC; border-radius: 10px; padding: 2px 10px; white-space: nowrap; }
+.mri details[open] > summary::after { content: 'Click to close'; color: #0052CC; background: #FFFFFF; border: 1px solid #0052CC; }
 .mri details > summary:hover { background: #DEEBFF; }
-.mri details.mri-row { border: 1px solid #DFE1E6; border-radius: 4px; margin: 4px 0; background: #fff; }
+.mri details > summary:hover::after { text-decoration: underline; }
+.mri details > summary:focus-visible { outline: 2px solid #0052CC; outline-offset: 1px; }
+.mri details[open] > summary { border-bottom: 1px solid #B3D4FF; border-radius: 4px 4px 0 0; }
+.mri details.mri-row { border: 1px solid #4C9AFF; border-left-width: 4px; border-radius: 4px; margin: 6px 0; background: #fff; }
 .mri details.mri-row > summary { padding: 8px 10px; font-size: 13px; }
-.mri details.mri-sub { margin: 6px 0; border: 1px solid #DFE1E6; border-radius: 4px; }
-.mri details.mri-sub > summary { padding: 6px 8px; font-size: 13px; font-weight: bold; }
+.mri details.mri-sub { margin: 6px 0; border: 1px solid #4C9AFF; border-left-width: 4px; border-radius: 4px; background: #fff; }
+.mri details.mri-sub > summary { padding: 8px 10px; font-size: 13px; font-weight: bold; }
 .mri details.mri-sub > div { padding: 4px 10px 8px 24px; }
 .mri .mri-hint { color: #5E6C84; font-size: 12px; font-weight: normal; }
 </style>""")
 
     def skippedNote = { String key ->
         p(style: 'color:#5E6C84;font-style:italic') {
-            mkp.yield timeSkipped.contains(key)
-                    ? "Not run — the ${TIME_BUDGET_SEC}s time budget was reached first. Re-run with a larger budget, or use Custom to run just this check."
-                    : 'Not included at this report depth.'
+            mkp.yield checkErrors.containsKey(key)
+                    ? "This check failed (${checkErrors[key]}), so its results are not shown. See Problems in this run at the top for the fix.".toString()
+                    : timeSkipped.contains(key)
+                    ? "Not run — the ${TIME_BUDGET_SEC}s time budget was reached first. Re-run with a larger time limit (option 1), or with fewer \"Include\" options."
+                    : 'Not included in this run. Tick its "Include" option to add it.'
         }
     }
     def kvTable = { List<List> rows ->
@@ -1208,7 +1335,6 @@ OutputFormatter.markupBuilder { builder ->
 
     div(class: 'mri') {
 
-        def depthLbl = [QUICK: 'Quick', STANDARD: 'Standard', FULL: 'Full', CUSTOM: 'Custom'][DEPTH] ?: DEPTH
 
         def renderers = [:] as Map<String, Closure>
         renderers['sec-1'] = {
@@ -1231,7 +1357,7 @@ OutputFormatter.markupBuilder { builder ->
             if (!ran.contains('CHECK_02_USERS')) skippedNote('CHECK_02_USERS') else {
                 if (!userScanRan) {
                     kvTable([['Total users', totalUsers, totalUsers <= THRESHOLD_LARGE_USERS ? okBadge('OK') : reviewBadge('LARGE — REVIEW')]])
-                    p(style: DIM) { mkp.yield 'Active/inactive counts and email checks were not run (they load every user). Use Standard or Full to include them.' }
+                    p(style: DIM) { mkp.yield userScanSkipReason ?: 'Active/inactive counts and email checks were not run (they load every user). Tick option 6 to include them.' }
                 } else kvTable([
                         ['Total users', totalUsers, totalUsers <= THRESHOLD_LARGE_USERS ? okBadge('OK') : reviewBadge('LARGE — REVIEW')],
                         ['Active users', activeUsers],
@@ -1411,7 +1537,7 @@ OutputFormatter.markupBuilder { builder ->
 
                 subGroup('Third-party apps not checked on the Marketplace', notCheckedPlugins.size()) {
                     p(style: DIM) {
-                        mkp.yield "Not looked up: the lookup is only on at Full depth, the per-run limit of ${MARKETPLACE_CHECK_MAX_APPS} was reached, " +
+                        mkp.yield "Not looked up: the lookup is only on with option 7, the per-run limit of ${MARKETPLACE_CHECK_MAX_APPS} was reached, " +
                                 'the time limit was reached, or the lookup failed. This is not the same as "not found".'
                     }
                     table(class: 'aui', style: 'width:100%') {
@@ -1512,7 +1638,31 @@ OutputFormatter.markupBuilder { builder ->
         h1(style: 'color:#172B4D;margin:0 0 4px') { mkp.yield 'ScriptRunner Migration Readiness' }
         p(style: DIM + ';margin:0 0 8px') {
             mkp.yield([ran.contains('CHECK_01_SYSTEM_INFO') ? "${baseUrl ?: ''} · Jira ${jiraVersion}" : null,
-                       "ScriptRunner ${srVersion}", "Generated ${new Date().format('yyyy-MM-dd HH:mm z')}", "Depth: ${depthLbl}"].findAll().join('  ·  '))
+                       "ScriptRunner ${srVersion}", "Generated ${new Date().format('yyyy-MM-dd HH:mm z')}", "Checked: ${INCLUDED_LABEL}"].findAll().join('  ·  '))
+        }
+        // ── Problems in this run, each with its fix (only when there are any) ──
+        if (problems) {
+            boolean anyError = problems.any { it.level == 'error' }
+            boolean anyWarn  = problems.any { it.level == 'warn' }
+            String border = anyError ? '#DE350B' : (anyWarn ? '#FF8B00' : '#0052CC')
+            String bg     = anyError ? '#FFEBE6' : (anyWarn ? '#FFFAE6' : '#F4F8FF')
+            div(style: "border:2px solid ${border};background:${bg};border-radius:6px;padding:10px 16px;margin:6px 0 14px") {
+                div(style: 'font-size:15px;font-weight:bold;margin-bottom:4px') {
+                    mkp.yield(((anyError || anyWarn) ? 'Problems in this run, and how to fix them' : 'Notes on this run') as String)
+                }
+                p(style: 'font-size:12px;margin:0 0 6px') { mkp.yield 'Nothing in Jira was changed. Scripts with unknown usage are never shown as "Archive or delete".' }
+                table(style: 'width:100%;border-collapse:collapse;font-size:13px') {
+                    thead { tr { th(scope: 'col', style: 'text-align:left;padding:4px;width:45%', 'What happened'); th(scope: 'col', style: 'text-align:left;padding:4px', 'How to fix it') } }
+                    tbody {
+                        problems.sort { [error: 0, warn: 1, info: 2][it.level as String] }.each { Map pr ->
+                            tr(style: 'border-top:1px solid rgba(0,0,0,0.1)') {
+                                td(style: 'padding:4px;vertical-align:top') { b([error: 'Error: ', warn: 'Check: ', info: 'Note: '][pr.level as String] as String); mkp.yield pr.what as String }
+                                td(style: 'padding:4px;vertical-align:top') { mkp.yield pr.fix as String }
+                            }
+                        }
+                    }
+                }
+            }
         }
         div(style: 'border:2px solid #0052CC;border-radius:6px;padding:12px 16px;margin:6px 0 14px;background:#F4F8FF') {
             div(style: 'font-size:15px;font-weight:bold;margin-bottom:6px') { mkp.yield 'Read this first: what this report is' }
@@ -1526,17 +1676,15 @@ OutputFormatter.markupBuilder { builder ->
                 }
             }
             p(style: 'font-size:11px;color:#5E6C84;margin:0') {
-                mkp.yield 'Best-effort proof of concept: not supported or maintained, read-only (nothing was changed), results indicative. '
-                mkp.yieldUnescaped("<span style='color:#0052CC;font-weight:bold'>&#9656;</span>")
-                mkp.yield ' = opens when clicked. '
-                span(style: 'color:#0052CC;text-decoration:underline') { mkp.yield 'Blue underlined ↗' }
-                mkp.yield ' = link. Nothing else is clickable.'
+                mkp.yield 'Best-effort proof of concept: not supported or maintained, read-only (nothing was changed), results indicative.'
             }
-        }
-        if (timeSkipped) {
-            div(style: BOX_WARN) {
-                b("⏱ ${timeSkipped.size()} area(s) were not checked because the ${TIME_BUDGET_SEC}s time limit was reached. ")
-                mkp.yield 'Results below are incomplete — raise the limit (form option 2) and re-run.'
+            div(style: 'font-size:13px;margin:8px 0 0;padding:6px 10px;background:#DEEBFF;border-radius:4px') {
+                b('How to use this page: ')
+                mkp.yield 'boxes with a blue edge and a '
+                mkp.yieldUnescaped("<span style='font-size:11px;font-weight:bold;color:#fff;background:#0052CC;border-radius:10px;padding:1px 8px;white-space:nowrap'>Click to open</span>")
+                mkp.yield ' button expand when you click anywhere on the line. Click again to close. '
+                span(style: 'color:#0052CC;text-decoration:underline') { mkp.yield 'Blue underlined ↗' }
+                mkp.yield ' text is a link. Nothing else is clickable.'
             }
         }
 
@@ -1548,23 +1696,31 @@ OutputFormatter.markupBuilder { builder ->
             p { mkp.yield srRrdUnavailable ? 'ScriptRunner usage files could not be read, so no usage can be shown. See the warnings in the Jira log.'
                     : 'No ScriptRunner scripts or script activity were found on this instance.' }
         } else {
-            // Headline: one count per group, problems first
-            div(style: 'border-left:6px solid #172B4D;background:#FAFBFC;padding:10px 14px;margin-bottom:8px') {
-                div(style: 'font-size:20px;font-weight:bold') { mkp.yield "${srScripts} ScriptRunner scripts found" + (srUnattributed ? ", plus ${srUnattributed} usage files not matched to a script" : '') }
-                div(style: 'margin-top:6px;font-size:13px;line-height:24px') {
-                    SR_GROUPS.findAll { srRowsByGroup[it.key as String] }.each { Map g ->
-                        int c = srRowsByGroup[g.key as String].size()
-                        span(style: 'margin-right:16px;white-space:nowrap') { mkp.yieldUnescaped(groupPill(g)); mkp.yield " ${c} ${(g.title as String).toLowerCase()}" }
-                    }
+            // Decision summary: the three answers the customer needs
+            int nKeep    = srRowsByGroup['INUSE'].size()
+            int nArchive = srRowsByGroup['RETIRE'].size()
+            int nCheck   = srRowsByGroup['IDENTIFY'].size() + srRowsByGroup['NOTREAD'].size() + srRowsByGroup['NODATA'].size()
+            p(style: 'font-size:13px;margin:0 0 8px') {
+                mkp.yield "${srScripts} ScriptRunner scripts found" + (srUnattributed ? ", plus ${srUnattributed} usage files not matched to a script" : '') +
+                        ". Based on usage in the last ${SR_DAYS_TXT}:"
+            }
+            def tile = { String colour, String bgc, int n, String label, String sub ->
+                div(style: "flex:1 1 200px;border:2px solid ${colour};border-top-width:8px;background:${bgc};border-radius:6px;padding:10px 14px") {
+                    div(style: 'font-size:32px;font-weight:bold;line-height:1.1') { mkp.yield String.format('%,d', n) }
+                    div(style: 'font-size:15px;font-weight:bold;margin:2px 0 4px') { mkp.yield label }
+                    div(style: 'font-size:12px;color:#42526E;line-height:1.4') { mkp.yield sub }
                 }
             }
+            div(style: 'display:flex;flex-wrap:wrap;gap:10px;margin:0 0 10px') {
+                tile('#00875A', '#E3FCEF', nKeep, 'Keep', "Ran in the last ${SR_DAYS_TXT}. Keep and convert with ScriptRunner Migration Suite.".toString())
+                tile('#FF8B00', '#FFFAE6', nArchive, 'Archive or delete', "No run in the last ${SR_DAYS_TXT}. If the owner agrees, archive (disable) or delete on Data Center before export.".toString())
+                tile('#6B778C', '#F4F5F7', nCheck, 'Check first', 'Usage unknown. Do not archive or delete until checked.')
+            }
             // Bar: same groups, same colours, same order as the lists below
-            if (srNotReadKeys || srRrdUnavailable || srNodesMissing) {
+            if (srNotReadKeys || srUnreadableKeys || srRrdUnavailable || srNodesMissing || srListCut || srFailed) {
                 div(style: BOX_WARN) {
                     b('Usage data is incomplete. ')
-                    mkp.yield srRrdUnavailable ? 'The usage files could not be read, so no script is marked as unused.'
-                            : srNodesMissing ? "No usage folder was found for cluster node(s) ${srNodesMissing.join(', ')}, so no script is marked as unused. Scripts without a recorded run are listed as \"Not read\". Check those nodes with your Jira administrator."
-                            : "${srNotReadKeys.size()} usage file(s) were not read before the time limit. Those scripts are listed as \"Not read\", not as unused. Raise the time limit (form option 2) and re-run."
+                    mkp.yield 'Some scripts are under "Check first" instead of Keep or Archive. The fix is in Problems in this run, at the top.'
                 }
             }
             String barAlt = 'ScriptRunner scripts by usage: ' + SR_GROUPS.findAll { srRowsByGroup[it.key as String] }
@@ -1579,7 +1735,7 @@ OutputFormatter.markupBuilder { builder ->
                     }
                 }
             }
-            p(class: 'mri-hint', style: 'margin:0 0 8px') { mkp.yield "The bar is a picture only. Open a group below to see each script: on how many days it ran in the last ${SR_DAYS_TXT}, and when it last ran." }
+            p(class: 'mri-hint', style: 'margin:0 0 8px') { mkp.yield "The bar is a picture only. Click a group below to see each script: on how many days it ran in the last ${SR_DAYS_TXT}, and when it last ran. Archive or delete is open first." }
 
             // Drill-down: one collapsible group per colour
             SR_GROUPS.findAll { srRowsByGroup[it.key as String] }.each { Map g ->
@@ -1598,10 +1754,23 @@ OutputFormatter.markupBuilder { builder ->
                     return (x.type as String) <=> (y.type as String) ?: (x.name as String) <=> (y.name as String)
                 }
                 String sortNote = g.key == 'RETIRE' ? 'Longest unused first.' : (g.key in ['INUSE', 'IDENTIFY'] ? 'Ran on the most days first, then most recent.' : '')
-                mkp.yieldUnescaped("<details class='mri-sub'><summary>" + groupPill(g) + '&nbsp; ')
+                mkp.yieldUnescaped("<details class='mri-sub'" + (g.key == 'RETIRE' ? ' open' : '') + "><summary>" + groupPill(g) + '&nbsp; ')
                 mkp.yield "${g.title} (${rs.size()})"
                 span(class: 'mri-hint') { mkp.yield ' — ' + (g.explain as String) }
                 mkp.yieldUnescaped("</summary><div>")
+                if (g.key == 'RETIRE' && rs) {
+                    div(style: 'background:#FFFAE6;border-left:4px solid #FF8B00;padding:8px 12px;margin:4px 0 8px;font-size:12px') {
+                        b('How to archive or delete safely')
+                        ol(style: 'margin:4px 0 0;padding-left:18px;line-height:1.5') {
+                            li { mkp.yield "Agree with the script's owner first. Usage is not value: a script that runs once a year can be critical. Not sure? Re-run with option 2 set to 365." }
+                            li { mkp.yield 'Keep a copy of the script code before changing anything.' }
+                            li { mkp.yield 'Archive = disable it where ScriptRunner offers that. It keeps a copy, and "Export active scripts only" leaves it out of the Script Registry export.' }
+                            li { mkp.yield 'Workflow scripts are removed by editing the workflow, which changes live transitions. Your Jira administrator should test this first.' }
+                            li { mkp.yield 'Script fields may hold values on issues. Check with your Jira administrator before removing one.' }
+                            li { mkp.yield 'Delete only once the owner agrees and a copy is kept.' }
+                        }
+                    }
+                }
                 if (!rs) {
                     p(class: 'mri-hint') { mkp.yield 'None.' }
                 } else {
@@ -1644,20 +1813,21 @@ OutputFormatter.markupBuilder { builder ->
             subGroup('Copy the full list into a spreadsheet', srRows.size()) {
                 p(class: 'mri-hint', style: 'margin:0 0 6px') {
                     mkp.yield 'Click in the box, select all (Ctrl+A or Cmd+A), copy, and paste into Excel or Google Sheets. ' +
-                            'It pastes straight into columns, so you can add an owner and a decision for each script.'
+                            'It pastes straight into columns, with the suggested decision first and empty Owner and Final decision columns to fill in.'
                 }
                 def clean = { v -> (v == null ? '' : v.toString()).replaceAll(/[\t\r\n]+/, ' ') }
                 Map<String, String> groupTitle = SR_GROUPS.collectEntries { [(it.key): it.title] }
                 // The chosen-window column is left out when it would repeat the fixed 30- or 90-day column.
                 boolean dupWindow = (SR_DORMANT_DAYS as int) in [30, 90]
-                List<String> hdr = ['Usage group', 'Type', 'Name', 'Projects / scope', "Days it ran, last ${SR_DAYS_TXT}".toString(), 'Last run (UTC)', 'Days since last run', 'Days it ran, last 30 days', 'Days it ran, last 90 days']
-                if (dupWindow) hdr.remove(4)
+                List<String> hdr = ['Suggested decision', 'Usage group', 'Type', 'Name', 'Projects / scope', "Days it ran, last ${SR_DAYS_TXT}".toString(), 'Last run (UTC)', 'Days since last run', 'Days it ran, last 30 days', 'Days it ran, last 90 days']
+                hdr += ['Owner', 'Final decision']
+                if (dupWindow) hdr.remove(5)
                 List<String> lines = [hdr.join('\t')]
                 SR_GROUPS.each { Map g ->
                     srRowsByGroup[g.key as String].each { Map r ->
-                        List vals = [groupTitle[g.key as String], r.type, r.name, r.where, r.dX, r.lastRun,
-                                     r.daysAgo != null ? r.daysAgo : '', r.d30, r.d90]
-                        if (dupWindow) vals.remove(4)
+                        List vals = [g.action, groupTitle[g.key as String], r.type, r.name, r.where, r.dX, r.lastRun,
+                                     r.daysAgo != null ? r.daysAgo : '', r.d30, r.d90, '', '']
+                        if (dupWindow) vals.remove(5)
                         lines << vals.collect { clean(it) }.join('\t')
                     }
                 }
@@ -1668,7 +1838,7 @@ OutputFormatter.markupBuilder { builder ->
             // Secondary and reference views
             subGroup('By feature type', srByType.size()) {
                 table(class: 'aui', style: 'width:100%') {
-                    thead { tr { th(scope: 'col', 'Feature type'); th(scope: 'col', style: 'text-align:right', 'Scripts'); th(scope: 'col', style: 'text-align:right', 'In use'); th(scope: 'col', style: 'text-align:right', 'Consider retiring') } }
+                    thead { tr { th(scope: 'col', 'Feature type'); th(scope: 'col', style: 'text-align:right', 'Scripts'); th(scope: 'col', style: 'text-align:right', 'In use'); th(scope: 'col', style: 'text-align:right', 'Archive or delete') } }
                     tbody {
                         srByType.each { Map t ->
                             tr { td(t.type as String); td(style: 'text-align:right', t.total as String); td(style: 'text-align:right', t.active as String); td(style: 'text-align:right', t.retire as String) }
@@ -1699,7 +1869,7 @@ OutputFormatter.markupBuilder { builder ->
                     li { mkp.yield 'The report shows on how many days a script ran, not how many times. ScriptRunner\'s stored data cannot give an exact run count, so none is shown. A failed run still counts as a run.' }
                     li { mkp.yield 'Runs from the last few minutes may not show yet; the SR Performance tab is real-time.' }
                     li { mkp.yield 'Days and dates are UTC calendar days. A run within about 5 minutes of midnight UTC may count on the next day. Last run is a date only (no time of day), and looks back as far as ScriptRunner keeps data — up to 2 years in this report. "No run recorded" means no run was found in that period.' }
-                    li { mkp.yield 'Listeners cannot be listed by API, so they appear under "Not matched" unless named (form option 4). Listeners that never ran do not appear. "Not matched" can also include other ScriptRunner features and deleted scripts, so it is not a list of listeners.' }
+                    li { mkp.yield 'Listeners cannot be listed by API, so they appear under "Not matched" unless named (form option 3). Listeners that never ran do not appear. "Not matched" can also include other ScriptRunner features and deleted scripts, so it is not a list of listeners.' }
                     li { mkp.yield 'REST endpoints and JQL functions appear only once they have been called.' }
                     li { mkp.yield 'Not included: Script Fragments, Mail Handlers, Resources and built-in scripts (no usage data is collected for them). Workflow conditions show usage only where ScriptRunner has recorded it.' }
                     li { mkp.yield '"Projects / scope" is where a script is configured to apply, not which projects triggered each run.' }
@@ -1714,7 +1884,7 @@ OutputFormatter.markupBuilder { builder ->
             b('Next steps: how this report fits your ScriptRunner migration')
             p(style: 'margin:4px 0 0') { mkp.yield 'Best used before the Script Registry export, so retired scripts are never analysed or converted. Already ran ScriptRunner Migration Suite Analyse and Assess? Use both together, then export and analyse again after retiring scripts.' }
             ol(style: 'margin:6px 0 0;padding-left:20px') {
-                li(style: 'margin-bottom:4px') { b('Consider retiring unused scripts on Data Center — '); mkp.yield 'review the "consider retiring" list with owners, and delete or disable anything no longer needed. This report narrows the list; it does not assess migratability.' }
+                li(style: 'margin-bottom:4px') { b('Archive or delete unused scripts on Data Center — '); mkp.yield 'review the "Archive or delete" list with owners, and disable or delete anything no longer needed. This report narrows the list; it does not assess migratability.' }
                 li(style: 'margin-bottom:4px') {
                     b('Script Registry export — '); mkp.yield "choose \"Export active scripts only\", so disabled (retired) scripts are left out. Script roots, and saved JQL filters that use ScriptRunner JQL functions, are always included (${yesNo(exportAvailable)}). "
                     extLink('https://docs.adaptavist.com/sr4js/latest/features/script-registry', 'Script Registry docs')
@@ -1736,7 +1906,7 @@ OutputFormatter.markupBuilder { builder ->
             p(style: 'font-size:13px;margin:0 0 6px') {
                 mkp.yield((redCountShown ? "${redCountShown} area(s) to review before migrating, ${amberCountShown} to plan for or tidy up. "
                         : (amberCountShown ? "Nothing to review before migrating; ${amberCountShown} area(s) to plan for or tidy up. " : 'Nothing flagged. ')) +
-                        'Most relevant to ScriptRunner first. Each line shows the result; open it for why it matters and the full data.')
+                        'Most relevant to ScriptRunner first. Each line shows the result; click it for why it matters and the full data.')
             }
             div(style: 'font-size:12px;margin-bottom:6px;line-height:22px') {
                 LIGHTS.each { String k, Map v -> span(style: 'margin-right:14px;white-space:nowrap') { mkp.yieldUnescaped(pill(k)); mkp.yield " ${v.label}" } }
@@ -1759,7 +1929,7 @@ OutputFormatter.markupBuilder { builder ->
             }
         }
         if (hiddenGroups) {
-            p(class: 'mri-hint', style: 'margin-top:6px') { mkp.yield 'Left out of this run (form options 5–7): ' + hiddenGroups.collect { REPORT_GROUPS[it].title }.join(', ') + '.' }
+            p(class: 'mri-hint', style: 'margin-top:6px') { mkp.yield 'Not included in this run (tick options 4, 5 or 8 to add): ' + hiddenGroups.collect { REPORT_GROUPS[it].title }.join(', ') + '.' }
         }
 
         // ═════ 4. ABOUT THIS RUN (reference) ═══════════════════════════════
@@ -1769,16 +1939,16 @@ OutputFormatter.markupBuilder { builder ->
                 thead { tr { th(scope: 'col', 'Setting'); th(scope: 'col', 'Value'); th(scope: 'col', 'What it meant for this report') } }
                 tbody {
                     def row = { String k, String v, String m -> tr { td { b(k) }; td(v); td(m) } }
-                    row('How thorough', depthLbl, "${ran.size()} of ${SECTION_INFO.size()} areas checked. " +
-                            (userScanRan ? 'User emails were checked. ' : 'User emails were not checked (Standard or Full adds this). ') +
-                            (MARKETPLACE_LOOKUP ? 'Apps were looked up on the Marketplace (internet calls made).' : 'Apps were not looked up on the Marketplace (Full adds this).'))
+                    row('Checked', INCLUDED_LABEL, "${ran.size()} of ${SECTION_INFO.size()} areas checked. " +
+                            (userScanRan ? 'User emails were checked. ' : 'User emails were not checked (option 6 adds this). ') +
+                            (MARKETPLACE_LOOKUP ? 'Apps were looked up on the Marketplace (internet calls made).' : 'Apps were not looked up on the Marketplace (option 7 adds this).'))
                     row('Maximum run time', "${TIME_BUDGET_SEC}s".toString(), "The run took ${String.format('%.1f', (RUN_END - RUN_START) / 1000d)}s. ScriptRunner was checked first. " +
                             (timeSkipped ? "${timeSkipped.size()} area(s) were skipped for time." : 'Nothing was skipped for time.'))
-                    row('Unused after', "${SR_DORMANT_DAYS} days".toString(), "Scripts with no recorded run in ${SR_DORMANT_DAYS} days are listed under \"Consider retiring\".")
+                    row('Unused after', "${SR_DORMANT_DAYS} days".toString(), "Scripts with no recorded run in ${SR_DORMANT_DAYS} days are listed under \"Archive or delete\".")
                     row('Listener names', SR_LISTENER_NAMES ? "${SR_LISTENER_NAMES.size()} entered".toString() : 'none',
                             SR_LISTENER_NAMES ? 'Matching listeners are shown by name.' : 'Listeners (if any) are shown as "Not matched".')
-                    row('Left out', hiddenGroups ? hiddenGroups.collect { REPORT_GROUPS[it].title }.join(', ') : 'nothing',
-                            hiddenGroups ? 'Not checked or shown. Untick in the form to include.' : 'Every group was included.')
+                    row('Not included', hiddenGroups ? hiddenGroups.collect { REPORT_GROUPS[it].title }.join(', ') : 'nothing',
+                            hiddenGroups ? 'Not checked or shown. Tick its "Include" option to add it.' : 'Every group was included.')
                 }
             }
             if (durationsMs) {
@@ -1798,3 +1968,25 @@ OutputFormatter.markupBuilder { builder ->
         }
     }
 }
+} catch (Throwable e) {
+    // The report itself could not be drawn: show a plain fallback with the decision lists.
+    log.error("Report could not be drawn: ${e}", e)
+    reportHtml = OutputFormatter.markupBuilder {
+        div(style: 'font-family:Arial,sans-serif;max-width:900px') {
+            div(style: 'border:2px solid #DE350B;background:#FFEBE6;border-radius:6px;padding:12px 16px;margin-bottom:12px') {
+                div(style: 'font-weight:bold;margin-bottom:4px') { mkp.yield 'The full report could not be drawn, so this simple version is shown.' }
+                p(style: 'margin:4px 0') { mkp.yield "Error: ${e.class.simpleName}: ${e.message ?: 'no message'}".toString() }
+                p(style: 'margin:4px 0') { mkp.yield 'Nothing in Jira was changed. Send this error text to your Adaptavist contact. The lists below are still valid.' }
+            }
+            SR_GROUPS.each { Map g ->
+                List<Map> rs = srRowsByGroup[g.key as String] ?: []
+                if (!rs) return
+                h3 { mkp.yield "${g.title} (${rs.size()})".toString() }
+                ul { rs.each { Map r -> li { mkp.yield "${r.type}: ${r.name} (last run: ${r.lastRun})".toString() } } }
+            }
+        }
+    }
+} finally {
+    System.clearProperty(RUN_LOCK_KEY)
+}
+return reportHtml
