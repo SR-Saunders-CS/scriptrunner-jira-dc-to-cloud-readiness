@@ -88,18 +88,18 @@ run day is missing from the daily rows until the script runs again. Only the
 | Behaviours | ScriptRunner behaviour manager | No usage recorded |
 | REST Endpoints | Usage files on disk | Method and name, e.g. `GET-myEndpoint` |
 | JQL Functions | Usage files on disk | Function name |
-| Script Listeners | Usage files on disk | ID (named via form field 4) |
+| Script Listeners | Usage files on disk | ID (named via form option 3) |
 
 Usage files that match nothing are listed as **"Not matched to a configured script"**,
-always in the "identify these" group, never in "Archive or delete". This list is not
+always in the "Check first: identify these" group, never in "Archive or delete". This list is not
 just listeners: it can include listeners, other ScriptRunner features, and deleted
 scripts. Name listeners with form option 3.
 
 ## Rules that protect against wrong conclusions
 
 - **Unread is never unused.** If the time limit stops the read, or the usage
-  folder is missing, affected scripts show as "Not read", not "Consider
-  retiring".
+  folder is missing, affected scripts show as "Not read", not "Archive or
+  delete".
 - **Unreadable is never unused.** A usage file that exists but can't be read puts
   that script under "Not read", not "Archive or delete".
 - **Every cluster node must be read.** On a cluster, the report asks Jira for its
@@ -109,11 +109,10 @@ scripts. Name listeners with form option 3.
   folder (any folder they left is still read). If an online node has no folder,
   scripts with no recorded run show as "Not read", and a warning names the node.
   (A node that has never run a script also has no folder, so this can be over-cautious.)
+  If the node list itself can't be checked, the same applies: nothing is judged unused.
 - **A failed check is never a silent gap.** If the ScriptRunner check fails part-way,
-  anything that would look unused becomes "Not read". Other failed checks are hidden
-  and listed under "Problems in this run".
-- **Not checked is never not found.** Apps not looked up on the Marketplace
-  show as "not checked" (amber), never "not found" (red).
+  anything that would look unused becomes "Not read", and the error is listed under
+  "Problems in this run" with its fix.
 - **No migratability judgements.** The report never says a script can't move to
   Cloud. That's the ScriptRunner Migration Suite's job.
 - **Conditions** only show usage where ScriptRunner has recorded it. Otherwise
@@ -130,7 +129,6 @@ scripts. Name listeners with form option 3.
 - Not included: Script Fragments, Mail Handlers, Resources, built-in scripts.
 - "Projects / scope" is where a script is configured to apply, not which
   project triggered each run.
-- Disabled apps aren't listed in the apps check.
 
 ## Protecting the Jira instance
 
@@ -143,9 +141,8 @@ scripts. Name listeners with form option 3.
   settings). The report travels back in the same browser request, so a run longer than
   the proxy or load balancer waits is lost while still using a Jira request thread.
   The run lock waits the cap plus 5 minutes after a cut-short run.
-- **ScriptRunner only by default.** Every other check is opt-in through the "Include" options.
-- **User email check** (option 6) loads every user into memory, so it's skipped above
-  50,000 users (`USER_EMAIL_SCAN_MAX_USERS` in the script's advanced settings).
+- **ScriptRunner only, no network calls.** v2.0.0 dropped the optional wider Jira checks.
+  They are still in v1.1.0 (GitHub tag).
 - **Every check is wrapped**, including against out-of-memory errors, so one failure
   doesn't lose the whole report. If the report itself can't be drawn, a plain version
   with the decision lists is shown instead.
@@ -153,12 +150,9 @@ scripts. Name listeners with form option 3.
 
 ## Time limit
 
-The time limit is checked before each check, and inside the long loops
-(reading usage files, listing workflow scripts and script fields, and Marketplace
-lookups). Scripts not listed because of the time limit have their usage files shown
-under "Identify", never as unused. ScriptRunner usage runs first.
+The time limit is checked inside the long loops (reading usage files, listing
+workflow scripts and script fields). Usage files not read because of the time limit
+show as "Not read". Scripts not listed because of the time limit have their usage
+files shown under "Identify". Neither is ever shown as unused.
 A single slow step can't be interrupted once started, so set the limit well
 below your proxy timeout.
-
-On a large instance, make the first run with the defaults (ScriptRunner only).
-Fastest run, least chance of a timeout.
