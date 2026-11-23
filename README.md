@@ -2,7 +2,9 @@
 
 > **Best-effort proof of concept.** Not supported, not maintained, not an official Adaptavist or Atlassian tool. Read-only. Results are indicative: verify before acting.
 
-> **For a real analysis of your instance, use the [ScriptRunner Migration Suite](https://docs.adaptavist.com/sms/latest).** Its Analyse and Assess tool shows how each script moves to Cloud; its Migration Agent converts them. This report doesn't replace it. It only helps you decide what you might not need to convert at all.
+> **The point:** get an idea of which ScriptRunner scripts you actually use on Data Center, so you can archive/retire the ones you don't and convert less in the [ScriptRunner Migration Suite](https://docs.adaptavist.com/sms/latest).
+
+> **For a real analysis of your instance, use the [ScriptRunner Migration Suite](https://docs.adaptavist.com/sms/latest).** Its Analyse and Assess tool shows how each script moves to Cloud; its Migration Agent converts them. This report doesn't replace it.
 
 ## What it is for
 
