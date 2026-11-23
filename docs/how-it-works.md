@@ -91,19 +91,27 @@ run day is missing from the daily rows until the script runs again. Only the
 | Script Listeners | Usage files on disk | ID (named via form field 4) |
 
 Usage files that match nothing are listed as **"Not matched to a configured script"**,
-always in the "identify these" group, never in "Consider retiring". This list is not
+always in the "identify these" group, never in "Archive or delete". This list is not
 just listeners: it can include listeners, other ScriptRunner features, and deleted
-scripts. Name listeners with form option 4.
+scripts. Name listeners with form option 3.
 
 ## Rules that protect against wrong conclusions
 
 - **Unread is never unused.** If the time limit stops the read, or the usage
   folder is missing, affected scripts show as "Not read", not "Consider
   retiring".
+- **Unreadable is never unused.** A usage file that exists but can't be read puts
+  that script under "Not read", not "Archive or delete".
 - **Every cluster node must be read.** On a cluster, the report asks Jira for its
-  node list and compares it with the node folders found. If any node has no folder,
+  node list and compares it with the node folders found. ScriptRunner cleans up node
+  IDs before using them as folder names (SRJIRA-4961), so both are compared with only
+  letters and digits kept. Nodes Jira lists as offline are not required to have a
+  folder (any folder they left is still read). If an online node has no folder,
   scripts with no recorded run show as "Not read", and a warning names the node.
   (A node that has never run a script also has no folder, so this can be over-cautious.)
+- **A failed check is never a silent gap.** If the ScriptRunner check fails part-way,
+  anything that would look unused becomes "Not read". Other failed checks are hidden
+  and listed under "Problems in this run".
 - **Not checked is never not found.** Apps not looked up on the Marketplace
   show as "not checked" (amber), never "not found" (red).
 - **No migratability judgements.** The report never says a script can't move to
@@ -124,12 +132,33 @@ scripts. Name listeners with form option 4.
   project triggered each run.
 - Disabled apps aren't listed in the apps check.
 
+## Protecting the Jira instance
+
+- **One run at a time per node.** A run keeps going on the server even if the browser
+  gives up. A JVM system property marks a run in progress; a second click shows a
+  "still running" message instead of starting another run. It clears at the end of the
+  run, or after 10 minutes if a run was cut short. It is per node: on a cluster, a run
+  routed to a different node isn't blocked.
+- **Time limit capped at 300 seconds** by default (`TIME_BUDGET_MAX_SEC`, advanced
+  settings). The report travels back in the same browser request, so a run longer than
+  the proxy or load balancer waits is lost while still using a Jira request thread.
+  The run lock waits the cap plus 5 minutes after a cut-short run.
+- **ScriptRunner only by default.** Every other check is opt-in through the "Include" options.
+- **User email check** (option 6) loads every user into memory, so it's skipped above
+  50,000 users (`USER_EMAIL_SCAN_MAX_USERS` in the script's advanced settings).
+- **Every check is wrapped**, including against out-of-memory errors, so one failure
+  doesn't lose the whole report. If the report itself can't be drawn, a plain version
+  with the decision lists is shown instead.
+- **Log output is capped** at 200 script lines.
+
 ## Time limit
 
-The time limit is checked before each check, and inside the two long loops
-(reading usage files, and Marketplace lookups). ScriptRunner usage runs first.
+The time limit is checked before each check, and inside the long loops
+(reading usage files, listing workflow scripts and script fields, and Marketplace
+lookups). Scripts not listed because of the time limit have their usage files shown
+under "Identify", never as unused. ScriptRunner usage runs first.
 A single slow step can't be interrupted once started, so set the limit well
 below your proxy timeout.
 
-On a large instance, make the first run Quick with form options 5, 6 and 7 ticked
-(ScriptRunner usage only). Fastest run, least chance of a timeout.
+On a large instance, make the first run with the defaults (ScriptRunner only).
+Fastest run, least chance of a timeout.
