@@ -1,6 +1,6 @@
 # ScriptRunner for Jira: Data Center usage report
 
-> **Best-effort proof of concept.** Not supported, not maintained, not an official Adaptavist or Atlassian tool. Read-only. No network calls. Results are indicative: verify before acting.
+> **Best-effort proof of concept.** Not supported, not maintained, not an official Adaptavist or Atlassian tool. Read-only for Jira. Writes one file (the saved report, see below). No network calls. Results are indicative: verify before acting.
 
 > **The point:** see which ScriptRunner scripts are actually being used on Data Center. Retire or archive the ones nobody needs, so you have fewer scripts to convert with the [ScriptRunner Migration Suite](https://docs.adaptavist.com/sms/latest).
 
@@ -31,10 +31,10 @@ Best used before the Script Registry export. Already ran Analyse and Assess? Use
 
 - Jira Data Center with ScriptRunner for Jira installed.
 - A Jira administrator who can open the ScriptRunner **Script Console**.
-- Tested on Jira 10.3.24 and ScriptRunner 9.30.0, single node. Other versions may work but are untested.
+- Tested on Jira 10.3.24 with ScriptRunner 9.30.0, and Jira 10.3.27 with ScriptRunner 9.46.0, single node. Other versions may work but are untested.
 - Try it on a non-production instance first if you can.
 
-**Is it safe?** It only reads. It changes no data or configuration and makes no network calls.
+**Is it safe?** It changes no Jira data or configuration and makes no network calls. It writes one file: the finished report, saved to `$JIRA_HOME/scriptrunner/migration-readiness/last-report.html` and overwritten on each run. The file lists script, workflow and project names, and gets the Jira home folder's normal file permissions. Nothing else is written.
 
 ### On a cluster (multi-node)
 
@@ -55,9 +55,10 @@ Not yet tested on a cluster: please report what you see.
 
 | # | Option | Default | What it does |
 |---|---|---|---|
-| 1 | Maximum run time (seconds) | 50 | Browsers and proxies often give up after about 60 s. The report stops reading at this limit and marks anything unread as "Not read". |
+| 1 | Maximum run time (seconds) | 50 | Browsers and proxies often give up after about 60 s. The report stops reading at this limit and marks anything unread as "Not read". Capped at 300 unless `TIME_BUDGET_MAX_SEC` is raised in the script. |
 | 2 | Treat a script as unused after (days) | 90 | Window for "days it ran". Widen it (e.g. 365) to catch quarterly or yearly scripts. |
 | 3 | Script Listener names | blank | Labels listeners, which ScriptRunner can't list by name. Format: `uuid=Name; uuid=Name`. Find a UUID in ScriptRunner admin → Listeners → Edit → last part of the browser URL. |
+| 4 | Show the last saved report | blank | Type `yes` to show the last saved report straight away, without running anything. Use it when the page timed out or showed an error before the report appeared. |
 
 ## Reading the report
 
@@ -102,13 +103,23 @@ How the data is read, and why: [docs/how-it-works.md](docs/how-it-works.md).
 
 | Problem | Fix |
 |---|---|
-| Page times out, no report | Wait 5 minutes (the run carries on on the server), then re-run once with option 1 lower (e.g. 40). |
+| Page times out, goes blank, or says "Failed to post update" | Don't click Run again. The run carries on on the server and saves its report. Wait for the time limit plus a few minutes, then type `yes` in option 4 and click Run. |
 | Scripts show "Not read" | Follow the fix in "Problems in this run". If the time limit was reached, raise option 1 and re-run. |
 | Many "Identify" rows | Mostly listeners. Name them with option 3. |
 | "No usage folder found for cluster node(s)" | A node in the cluster has no usage files, so nothing is marked unused. Check that node with your Jira administrator; a brand-new node that hasn't run a script yet also causes this. |
 | "RRD directory not found" | ScriptRunner usage files weren't found, so nothing is marked unused. Check ScriptRunner is installed and has run scripts. On a cluster, check the shared home is mounted on that node. |
-| "Another run is still in progress" | Wait the minutes shown, then run once. |
+| "Another run is still in progress" | Wait the minutes shown. The last saved report (from an earlier run) is shown below the message, clearly dated. When the run finishes, use option 4 to see its report. |
+| "Report could not be saved" in the log | The Jira home folder isn't writable by Jira. The report on screen is unaffected. |
 
 ## Version
+
+2.1.0:
+- Scripts are listed first, then their usage files are read first. Files that match no configured script are read only if time remains, so large instances spend their time on scripts that matter.
+- A script with a recent run in any file that was read shows as Keep, even if another node's file for it wasn't read. Before, it showed as "Not read".
+- The finished report is saved to one file and can be shown again with option 4.
+- Workflow conditions whose usage file was skipped by the time limit now show as "Not read", not "No data".
+- 40-character hash IDs are listed under "Identify" instead of being labelled "JQL Function".
+- The time limit covers the whole run: listing gets at most 30% of it, and reading stops early enough to build and save the report.
+- Time taken by each step is shown in the report and the Jira log.
 
 2.0.0: ScriptRunner usage only. The optional wider Jira readiness checks (apps, users, directories, inventory) were removed; they're still in [v1.1.0](https://github.com/SR-Saunders-CS/scriptrunner-jira-dc-to-cloud-readiness/tree/v1.1.0). For Jira-wide counts, use ScriptRunner's [Instance Audit](https://docs.adaptavist.com/sr4js/latest/best-practices/audit-your-jira-instance-using-scriptrunner) built-in script and Atlassian's [pre-migration checklist](https://support.atlassian.com/migration/docs/jira-pre-migration-checklist/).
