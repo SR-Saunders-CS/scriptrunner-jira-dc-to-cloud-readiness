@@ -28,7 +28,7 @@
 //   3. Read the HTML report below the console. Start with "Read this first".
 //   On a cluster, run it once, from any node. It reads every node's usage files.
 //
-// SAFETY BUILT IN (v2.1.0)
+// SAFETY BUILT IN (v2.3.0)
 //   • Only one run at a time per node: clicking Run again while a run is still going
 //     shows a "still running" message instead of starting a second run.
 //   • Maximum run time is capped at 300 seconds by default (TIME_BUDGET_MAX_SEC in
@@ -39,6 +39,25 @@
 //     waiting. Type yes in option 4 to show it without running anything.
 //   • Scripts are listed first, then their usage files are read first, so time is not
 //     spent on files that match no configured script.
+//
+// NEW IN v2.2.0
+//   • Usage files are matched using ScriptRunner's own list of scripts (the list behind
+//     its execution history), so listeners are named automatically.
+//   • ScriptRunner keeps a script's usage file after the script is deleted or its ID
+//     changes. Files that match no current script are shown as "Left over": no action
+//     if they have not run recently, "Check first" if they ran recently or were not read.
+//   • If ScriptRunner's list cannot be read, the report works as in v2.1.0.
+//   • Behaviours now show usage: ScriptRunner records each script inside a behaviour
+//     under its own ID, read from the behaviour's configuration.
+//
+// NEW IN v2.3.0 (large instances)
+//   • A usage file is only written when its script runs. A file not changed for longer
+//     than the chosen period (at least 90 days) cannot hold a recent run, so it is judged
+//     "no recent run" from its file date when there is no time to open it. Left-over files
+//     of that age are never opened.
+//   • Files are read newest first, in parallel (READ_THREADS in ADVANCED SETTINGS).
+//   • Listing scripts gets its own share of the time limit (finding files no longer uses it up).
+//   • Key progress lines are logged at WARN, so they reach atlassian-jira.log.
 //
 // IF SOMETHING GOES WRONG
 //   • Page hangs, goes blank or says "Failed to post update": the run carries on on the
@@ -73,6 +92,17 @@ import org.rrd4j.core.FetchData
 import org.rrd4j.core.RrdDb
 
 import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.DirectoryStream
+import java.nio.file.Path
+import java.nio.file.attribute.BasicFileAttributes
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.Executors
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.ThreadFactory
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.nio.file.Files
 import java.nio.file.StandardCopyOption
 
@@ -97,8 +127,8 @@ Integer FORM_TIME_BUDGET
 Integer FORM_DORMANT_DAYS
 
 @ShortTextInput(label = '3. Script Listener names (optional)',
-        description = 'Why we ask: ScriptRunner cannot list listener names automatically, so listeners ' +
-                'appear as "Not matched" in the report. Effect: entering names labels them properly. ' +
+        description = 'Why we ask: since v2.2.0 listeners are named automatically from ScriptRunner\'s own list. ' +
+                'Only needed if the report says that list could not be read; names entered here are used first. ' +
                 'Format: uuid=Name; uuid=Name. Find a UUID in SR admin → Listeners → Edit → the last part of the browser URL. Blank = skip.')
 String FORM_LISTENER_NAMES
 
@@ -128,6 +158,10 @@ int  TIME_BUDGET_MAX_SEC = 300
 int  TIME_BUDGET_SEC = (FORM_TIME_BUDGET && FORM_TIME_BUDGET > 0) ? Math.min(FORM_TIME_BUDGET as int, TIME_BUDGET_MAX_SEC) : 50
 boolean TIME_BUDGET_CAPPED = FORM_TIME_BUDGET && FORM_TIME_BUDGET > TIME_BUDGET_MAX_SEC
 
+// v2.3.0: usage files are read by this many parallel workers. 1 = one at a time (as before v2.3.0).
+// More workers finish sooner on large instances but put more read load on the shared home at once.
+int  READ_THREADS = 4
+
 // Long tables show this many rows, then "…and N more", so the page stays fast and scannable.
 // Every script is always in the "Copy the full list" box.
 def MAX_ROWS = 50
@@ -143,7 +177,8 @@ def overBudget  = { -> elapsedSec() >= TIME_BUDGET_SEC }
 // reading stops early enough to leave time to build and save the report.
 long LIST_BUDGET_SEC   = Math.max(10L, (long) (TIME_BUDGET_SEC * 0.3d))
 long BUILD_RESERVE_SEC = Math.min(30L, Math.max(5L, (long) (TIME_BUDGET_SEC * 0.1d)))
-def overListBudget = { -> elapsedSec() >= LIST_BUDGET_SEC }
+long srListStartSec = 0L   // v2.3.0: set when listing starts, so finding files does not use up the listing share
+def overListBudget = { -> elapsedSec() - srListStartSec >= LIST_BUDGET_SEC }
 def overReadBudget = { -> elapsedSec() >= TIME_BUDGET_SEC - BUILD_RESERVE_SEC }
 // Time per step, shown in the report and the log (helps compare runs and instances).
 Map<String, Double> srPhaseSec = [:]
@@ -224,7 +259,7 @@ def warn     = { String msg -> log.warn "    ⚠ ${msg}" }
 def done     = { String msg -> log.info "    ✔ ${msg}" }
 
 log.info "============================================================"
-log.info "  SCRIPTRUNNER USAGE REPORT — BEST-EFFORT POC (v2.1.0)"
+log.warn "  SCRIPTRUNNER USAGE REPORT — BEST-EFFORT POC (v2.3.0)"
 log.info "  ${new Date().format('yyyy-MM-dd HH:mm:ss z')}"
 log.info "============================================================"
 
@@ -250,11 +285,13 @@ try {
 // As seen on Jira 10.3.24 / SR 9.30.0: step 300s, data source 'count' (GAUGE),
 // blank rows = no run (no zeros are written).
 def srRows      = [] as List<Map>   // [type, name, where, key, d30, d90, dX, lastRun, status]
-def srWarnings  = [] as List<String>
+final String SR_LEFTOVER_TYPE = 'Left over: no current script'   // v2.2.0
+List<String> srWarnings = Collections.synchronizedList(new ArrayList<String>())
 def srNodeNames = [] as List<String>
-int srRrdFiles  = 0
+int srRrdFiles  = 0                              // usage files opened and read
+int srAgeJudged = 0                              // v2.3.0: usage IDs judged from file date only (not opened)
 Map srRrdMeta = [:]                              // detected value type and step sizes of the usage files
-Set<String> srMissingDs = [] as Set<String>      // usage files without a 'count' data source
+Set<String> srMissingDs = ConcurrentHashMap.newKeySet()   // usage files without a 'count' data source
 Set<String> srNotReadKeys = [] as Set<String>   // RRD files skipped because the time budget ran out
 boolean srRrdUnavailable = false                 // RRD folder missing or unreadable
 boolean srBudgetHit = false
@@ -268,6 +305,8 @@ boolean srClusterCheckFailed = false             // the cluster node check could
 int srRrdFilesFound    = 0                       // v2.1.0: usage files found on disk (read or not)
 int srMatchedNotRead   = 0                       // configured scripts with a usage file not read (time limit)
 int srUnmatchedNotRead = 0                       // usage file IDs matching no configured script, not read (time limit)
+Map<String, Map> srMap = null                    // v2.2.0: ScriptRunner's own list: functionId -> [cat, name]; null if it could not be read
+String srMapError = null                         // why ScriptRunner's own list could not be read
 try {
     log.info "[1] ScriptRunner usage (RRD)"
 
@@ -306,8 +345,10 @@ try {
             FetchData fine  = db.createFetchRequest(ConsolFun.AVERAGE, lastWrite - 2L * DAY, lastWrite, dbStep).fetchData()
             FetchData daily = db.createFetchRequest(ConsolFun.AVERAGE, nowSec - 730L * DAY, nowSec, DAY).fetchData()
             boolean dailyOk = daily.getStep() <= DAY
-            if (!srRrdMeta) srRrdMeta = [dsType: dsType, dbStep: dbStep, fineStep: fine.getStep(), dailyStep: daily.getStep(),
-                                         dailyOk: dailyOk]
+            synchronized (srMissingDs) {
+                if (!srRrdMeta) srRrdMeta = [dsType: dsType, dbStep: dbStep, fineStep: fine.getStep(), dailyStep: daily.getStep(),
+                                             dailyOk: dailyOk]
+            }
             Set<Long> days = [] as Set<Long>
             long last = 0L                                  // end time of the latest row with a run
             long[] fts = fine.getTimestamps(); double[] fv = fine.getValues('count'); long fStep = fine.getStep()
@@ -339,6 +380,7 @@ try {
     // Scripts are listed next and matched against these names, so reading (the slow part)
     // starts with the files that belong to configured scripts.
     Map<String, List<File>> rrdFilesByKey = [:]
+    Map<String, Long> rrdNewestByKey = [:]           // v2.3.0: newest file date (ms) per usage ID, across nodes
     try {
         File rrdRoot = new File(srJiraHome, 'scriptrunner/rrd')
         if (!rrdRoot.exists()) {
@@ -349,11 +391,24 @@ try {
             if (rrdRoot.listFiles()?.any { it.isFile() && it.name.endsWith('.rrd4j') }) dirs.add(0, rrdRoot)
             dirs.each { File dir ->
                 srNodeNames << (dir == rrdRoot ? '(flat layout)' : dir.name)
-                dir.listFiles()?.findAll { it.isFile() && it.name.endsWith('.rrd4j') }?.each { File f ->
-                    String key = f.name.substring(0, f.name.length() - '.rrd4j'.length())
-                    List<File> fs = rrdFilesByKey[key]
-                    if (fs == null) { fs = [] as List<File>; rrdFilesByKey[key] = fs }
-                    fs << f
+                // v2.3.0: one attribute read per file gives both "is a file" and its last-changed date.
+                DirectoryStream<Path> ds = Files.newDirectoryStream(dir.toPath(), '*.rrd4j')
+                try {
+                    for (Path pth : ds) {
+                        BasicFileAttributes a
+                        try { a = Files.readAttributes(pth, BasicFileAttributes) } catch (Exception ignored) { continue }
+                        if (!a.isRegularFile()) continue
+                        String fname = pth.fileName.toString()
+                        String key = fname.substring(0, fname.length() - '.rrd4j'.length())
+                        List<File> fs = rrdFilesByKey[key]
+                        if (fs == null) { fs = [] as List<File>; rrdFilesByKey[key] = fs }
+                        fs << pth.toFile()
+                        long mt = a.lastModifiedTime().toMillis()
+                        Long prev = rrdNewestByKey[key]
+                        if (prev == null || mt > prev) rrdNewestByKey[key] = mt
+                    }
+                } finally {
+                    try { ds.close() } catch (ignored) {}
                 }
             }
             // Cluster check: every node Jira knows about should have a usage folder. If any is missing,
@@ -394,18 +449,58 @@ try {
     lap('Finding usage files')
     done("Nodes: ${srNodeNames.join(', ') ?: 'none'}  |  Usage files found: ${srRrdFilesFound} (${rrdKeysOnDisk.size()} IDs)")
 
+    // ── Step 1b (v2.2.0): ScriptRunner's own list of scripts, by usage file ID ──
+    // The same list behind ScriptRunner's execution history: each current script's usage
+    // file ID (functionId) and name. Read-only. Loaded by name, so an older ScriptRunner
+    // without it still runs: the report then works as in v2.1.0.
+    // ScriptRunner does not delete a usage file when its script is deleted or its ID changes,
+    // so a file whose ID is not in this list is left over from a script that no longer exists.
+    try {
+        ClassLoader cl = this.class.classLoader
+        Class cpCls  = Class.forName('com.onresolve.scriptrunner.runner.diag.rrd.CategoryProvider', true, cl)
+        Class sbaCls = Class.forName('com.onresolve.spring.StaticBeanAccessor', true, cl)
+        def cp = sbaCls.getMethod('getBean', Class).invoke(null, cpCls)
+        Map<String, Map> m = [:]
+        (cp.getCategories() ?: []).each { cat ->
+            String cn = (cat?.getAt('name') ?: '') as String
+            (cat?.getAt('items') ?: []).each { item ->
+                String id = item?.getAt('functionId') as String
+                if (id) m[id] = [cat: cn, name: (item?.getAt('name') ?: '') as String]
+            }
+        }
+        srMap = m
+        done("ScriptRunner's own script list: ${m.size()} entries")
+    } catch (Throwable e) {
+        srMap = null
+        srMapError = "${e.class.simpleName}: ${e.message ?: 'no message'}".toString()
+        srWarnings << "ScriptRunner's own script list could not be read (${srMapError}). Listeners are not named and unmatched usage files are labelled as in v2.1.0.".toString()
+    }
+    lap('Reading ScriptRunner list')
+
     // ── Step 2: list configured scripts. Each one is recorded here and judged in step 4,
     // once its usage has been read. ──
+    srListStartSec = elapsedSec()
     Set<String> attributed = [] as Set<String>
     List<Map> srPending = [] as List<Map>
-    def addRow = { String type, String name, String where, String key, boolean tracked ->
+    // keys: v2.2.0, for scripts with several usage files (a behaviour has one per script inside it).
+    def addRow = { String type, String name, String where, String key, boolean tracked, List<String> keys = null ->
         if (key) attributed << key
-        srPending << [type: type, name: name, where: where, key: key, tracked: tracked]
+        if (keys) attributed.addAll(keys)
+        srPending << [type: type, name: name, where: where, key: key, tracked: tracked, keys: keys]
     }
     def finalizeRow = { Map p ->
         String type = p.type as String; String name = p.name as String; String where = p.where as String
         String key = p.key as String; boolean tracked = p.tracked as boolean
-        Map d = key ? rrd[key] : null
+        List<String> ks = (p.keys ?: (key ? [key] : [])) as List<String>
+        // Several usage files (v2.2.0, behaviours): days combined, latest run wins.
+        Map d = null
+        ks.each { String k ->
+            Map x = rrd[k]
+            if (x == null) return
+            d = d == null ? x : [days: ((d.days as Set<Long>) + (x.days as Set<Long>)) as Set<Long>, last: Math.max(d.last as long, x.last as long),
+                                 ageBefore: (d.ageBefore || x.ageBefore) ? Math.max((d.ageBefore ?: 0L) as long, (x.ageBefore ?: 0L) as long) : null,
+                                 ageOnly: (d.ageOnly && x.ageOnly)]
+        }
         boolean ranRecently = d != null && (d.last as long) > 0L &&
                 Math.floorDiv((d.last as long) - 1L, DAY) > todayKey - (SR_DORMANT_DAYS as long)
         String status
@@ -415,7 +510,7 @@ try {
         else if (ranRecently)       status = 'ACTIVE'
         // Any unread file for this script (e.g. one node read, another cut off by the time limit)
         // means usage is incomplete, so it is never judged unused.
-        else if (srRrdUnavailable || (key && (srNotReadKeys.contains(key) || srUnreadableKeys.contains(key)))) status = 'NOT READ'
+        else if (srRrdUnavailable || ks.any { String k -> srNotReadKeys.contains(k) || srUnreadableKeys.contains(k) }) status = 'NOT READ'
         // No usage file and a file with no recorded run mean the same thing: no run found.
         else if (d == null || (d.last as long) == 0L) status = 'NEVER RUN'
         else                        status = 'DORMANT'
@@ -426,11 +521,13 @@ try {
         Long lastDay    = d && (d.last as long) > 0L ? Math.floorDiv((d.last as long) - 1L, DAY) : null
         int dXn         = daysIn(days, SR_DORMANT_DAYS as long)
         srRows << [
-                type   : type, name: (name ?: '(unnamed)').trim(), where: where ?: '—', key: key ?: '—',
+                type   : type, name: (name ?: '(unnamed)').trim(), where: where ?: '—', key: key ?: (ks ? ks.join(', ') : '—'),
                 d30    : d ? "${daysIn(days, 30L)}".toString() : (tracked ? '0' : '—'),
                 d90    : d ? "${daysIn(days, 90L)}".toString() : (tracked ? '0' : '—'),
                 dX     : d ? "${dXn}".toString() : (tracked ? '0' : '—'),
-                lastRun: lastDay != null ? fmtDay(lastDay) : (tracked ? 'No run recorded' : 'Not tracked'),
+                lastRun: lastDay != null ? fmtDay(lastDay)
+                        : (d?.ageOnly ? "Not in the last ${Math.max(SR_DORMANT_DAYS as int, 90)} days (file last changed ${new Date(d.ageBefore as long).format('yyyy-MM-dd', TimeZone.getTimeZone('UTC'))})".toString()
+                        : (tracked ? 'No run recorded' : 'Not tracked')),
                 daysAgo: lastDay != null ? (todayKey - lastDay) : null,
                 sortDays: dXn,
                 status : status,
@@ -516,15 +613,59 @@ try {
         srWarnings << "Script fields could not be listed: ${e.message}".toString()
     }
 
-    // Behaviours (inventory only — SR does not record executions)
+    // Behaviours (v2.2.0): ScriptRunner records usage per script INSIDE a behaviour (its
+    // initialiser and field scripts), under that script's own ID, not the behaviour's ID.
+    // Those IDs are read from the behaviour's configuration. A behaviour counts as run when any
+    // of its scripts ran. If none of its scripts has a usage file, it shows as "No usage data",
+    // never as unused, because not every behaviour script is confirmed to record usage.
+    Set<String> srBehaviourKeys = [] as Set<String>
     try {
+        String B_UUID_RE = /[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/
         def bm = ComponentAccessor.getOSGiComponentInstanceOfType(BehaviourManager)
         (bm?.getAllConfigs() as Map)?.each { id, state ->
+            List<String> inner = (((state?.toString() ?: '') =~ B_UUID_RE).collect { it as String }.unique() - [id?.toString()]) as List<String>
+            boolean hasFile = inner.any { String u -> rrdKeysOnDisk.contains(u) }
+            srBehaviourKeys.addAll(inner)
             addRow('Behaviour', (state?.getAt('name') ?: id) as String,
-                    state?.getAt('disabled') ? 'Disabled in SR' : 'Not tracked by SR', null, false)
+                    state?.getAt('disabled') ? 'Disabled in SR' : (hasFile ? 'Where the behaviour is mapped' : 'No usage recorded for its scripts'),
+                    null, hasFile, inner)
         }
     } catch (Throwable e) {
         srWarnings << "Behaviours could not be listed: ${e.message}".toString()
+    }
+
+    // v2.2.0 sanity check: ScriptRunner's own list must contain most of the scripts listed above
+    // that have a usage file. If it does not (empty, or a different format on this version), it is
+    // not trusted, so no usage file is wrongly shown as left over. The report then works as in v2.1.0.
+    if (srMap != null) {
+        Set<String> ownKeys = attributed.findAll { String k -> rrdKeysOnDisk.contains(k) && !srBehaviourKeys.contains(k) } as Set<String>
+        int inMap = ownKeys.count { String k -> srMap.containsKey(k) } as int
+        if ((srMap.isEmpty() && rrdKeysOnDisk) || (ownKeys.size() >= 5 && inMap < ownKeys.size() * 0.5d)) {
+            srMapError = "it matched only ${inMap} of ${ownKeys.size()} scripts this report found".toString()
+            srWarnings << "ScriptRunner's own script list was not used (${srMapError}). Listeners are not named and unmatched usage files are labelled as in v2.1.0.".toString()
+            srMap = null
+        }
+    }
+
+    // v2.2.0: from ScriptRunner's own list. Listeners are listed whether or not they ran.
+    // REST endpoints and JQL functions only once called (as before), so built-in JQL functions
+    // that were never used are not listed. Any other current script with a usage file that the
+    // lists above missed (e.g. cut short by the time limit) is added under its own type.
+    if (srMap != null) {
+        Map<String, String> SR_CAT_TYPE = ['Script Listeners': 'Script Listener', 'REST Endpoints': 'REST Endpoint',
+                                           'JQL Functions': 'JQL Function', 'Jobs': 'Scheduled Job',
+                                           'Script Fields': 'Script Field', 'Workflow Functions': 'Workflow Function']
+        srMap.each { String id, Map e ->
+            if (attributed.contains(id)) return
+            String cat  = e.cat as String
+            String type = SR_CAT_TYPE[cat] ?: (cat ?: 'ScriptRunner script')
+            String name = (SR_LISTENER_NAMES[id] ?: e.name ?: id) as String
+            if (cat == 'Script Listeners') {
+                addRow(type, name, 'Scope not listed for listeners', id, true)
+            } else if (rrdKeysOnDisk.contains(id)) {
+                addRow(type, name, cat in ['REST Endpoints', 'JQL Functions'] ? 'Not project-scoped' : 'Found in ScriptRunner\'s execution history', id, true)
+            }
+        }
     }
 
     lap('Listing scripts')
@@ -535,42 +676,113 @@ try {
     String UUID_RE = /[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/
     String REST_RE = /(?i)(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)-.+/
     String HASH_RE = /[0-9a-fA-F]{40}/
+    // v2.2.0: with ScriptRunner's own list, a file is a script's file only if its ID is a current
+    // script. Without the list, the v2.1.0 name rules are used.
     def isScriptKey = { String k ->
-        attributed.contains(k) || SR_LISTENER_NAMES.containsKey(k) || (k ==~ REST_RE) ||
-                !((k ==~ UUID_RE) || (k ==~ /\d+/) || (k ==~ HASH_RE))
+        if (attributed.contains(k) || SR_LISTENER_NAMES.containsKey(k)) return true
+        if (srMap != null) return false
+        (k ==~ REST_RE) || !((k ==~ UUID_RE) || (k ==~ /\d+/) || (k ==~ HASH_RE))
     }
     List<String> matchedKeys   = rrdKeysOnDisk.findAll { String k -> isScriptKey(k) }.sort()
     List<String> unmatchedKeys = rrdKeysOnDisk.findAll { String k -> !isScriptKey(k) }.sort()
-    def readKey = { String key ->
-        (rrdFilesByKey[key] ?: []).each { File f ->
-            if (overReadBudget()) { srBudgetHit = true; srNotReadKeys << key; return }
-            srRrdFiles++
-            Map r = readRrd(f) as Map
-            // A file that exists but cannot be read means usage is unknown, not zero.
-            if (r == null) { srUnreadableKeys << key; return }
-            Map ex = rrd[key]
-            // Nodes: days are combined (a day counts once, whichever node ran it).
-            rrd[key] = ex == null ? r : [
-                    days  : ((ex.days as Set<Long>) + (r.days as Set<Long>)) as Set<Long>,
-                    last  : Math.max(ex.last as long, r.last as long),
-            ]
+    // ── v2.3.0 reading plan ──
+    // A usage file is only written when its script runs, so a file whose last change is older
+    // than the window (the chosen period, at least 90 days, plus one day for clock differences)
+    // cannot hold a run inside it. Such IDs are judged "no recent run" from the file date if
+    // there is no time to open them; left-over files of that age are never opened.
+    // Order: scripts with a recent file (newest first), then scripts with only old files (for
+    // exact last-run dates), then left-over files with a recent file.
+    long ageWindowDays = Math.max(SR_DORMANT_DAYS as long, 90L)
+    long oldBeforeMs   = (nowSec - (ageWindowDays + 1L) * DAY) * 1000L
+    def isOld = { String k -> Long mt = rrdNewestByKey[k]; mt != null && mt < oldBeforeMs }
+    def newestFirst = { List<String> ks -> ks.sort { String a, String b -> ((rrdNewestByKey[b] ?: 0L) <=> (rrdNewestByKey[a] ?: 0L)) ?: (a <=> b) } }
+    List<String> plan = []
+    plan.addAll(newestFirst(matchedKeys.findAll { !isOld(it) }))
+    plan.addAll(newestFirst(matchedKeys.findAll { isOld(it) }))
+    plan.addAll(newestFirst(unmatchedKeys.findAll { !isOld(it) }))
+    Set<String> oldLeftoverKeys = unmatchedKeys.findAll { isOld(it) } as Set<String>
+
+    // Files to read, in plan order. Workers take the next file until the reading time is used up.
+    ConcurrentLinkedQueue<List> queue = new ConcurrentLinkedQueue<List>()
+    plan.each { String k -> (rrdFilesByKey[k] ?: []).each { File f -> queue.add([k, f]) } }
+    Map<String, Map> fileResults = new ConcurrentHashMap<String, Map>()   // file path -> result, or [failed: true]
+    AtomicInteger filesRead = new AtomicInteger(0)
+    AtomicBoolean budgetHit = new AtomicBoolean(false)
+    int workers = Math.max(1, Math.min(READ_THREADS, 8))
+    ExecutorService pool = Executors.newFixedThreadPool(workers, { Runnable r ->
+        Thread t = new Thread(r, 'sr-usage-report-reader'); t.daemon = true; t
+    } as ThreadFactory)
+    try {
+        workers.times {
+            pool.submit({
+                while (true) {
+                    if (overReadBudget()) { if (!queue.isEmpty()) budgetHit.set(true); break }
+                    List item = queue.poll()
+                    if (item == null) break
+                    File f = item[1] as File
+                    Map r = null
+                    try { r = readRrd(f) as Map } catch (Throwable t) { srWarnings << "Could not read ${f.name}: ${t.message}".toString() }
+                    filesRead.incrementAndGet()
+                    fileResults[f.absolutePath] = r != null ? r : [failed: true]
+                }
+            } as Runnable)
         }
+        pool.shutdown()
+        // Workers stop themselves at the reading limit; wait a little past it for files in progress.
+        long waitSec = Math.max(5L, (TIME_BUDGET_SEC as long) - BUILD_RESERVE_SEC - elapsedSec() + 20L)
+        if (!pool.awaitTermination(waitSec, TimeUnit.SECONDS)) {
+            budgetHit.set(true)
+            srWarnings << 'Some usage files were still being read at the time limit and were left out.'
+        }
+    } finally {
+        pool.shutdownNow()
     }
-    matchedKeys.each { String k -> readKey(k) }
-    unmatchedKeys.each { String k -> readKey(k) }
+    srRrdFiles  = filesRead.get()
+    srBudgetHit = budgetHit.get()
+
+    // Combine per ID (single thread). A day counts once, whichever node ran it.
+    rrdFilesByKey.each { String key, List<File> fs ->
+        boolean anyUnread = false, anyFailed = false
+        Map comb = null
+        fs.each { File f ->
+            Map r = fileResults[f.absolutePath]
+            if (r == null) { anyUnread = true; return }
+            if (r.failed) { anyFailed = true; return }
+            comb = comb == null ? r : [days: ((comb.days as Set<Long>) + (r.days as Set<Long>)) as Set<Long>,
+                                       last: Math.max(comb.last as long, r.last as long)]
+        }
+        // Not opened (or not every node's file opened), but every file is older than the window:
+        // no run inside the window. A recent run in a file that WAS read still wins.
+        boolean ranInWindow = comb != null && (comb.last as long) > 0L &&
+                Math.floorDiv((comb.last as long) - 1L, DAY) > todayKey - (SR_DORMANT_DAYS as long)
+        if ((anyUnread || anyFailed) && !ranInWindow && isOld(key)) {
+            rrd[key] = comb != null && (comb.last as long) > 0L
+                    ? (comb + [ageBefore: rrdNewestByKey[key]])
+                    : [days: ([] as Set<Long>), last: 0L, ageBefore: rrdNewestByKey[key], ageOnly: true]
+            srAgeJudged++
+            return
+        }
+        if (comb != null) rrd[key] = comb
+        if (anyFailed) srUnreadableKeys << key
+        if (anyUnread) srNotReadKeys << key
+    }
     srMatchedNotRead   = matchedKeys.count { String k -> srNotReadKeys.contains(k) } as int
     srUnmatchedNotRead = unmatchedKeys.count { String k -> srNotReadKeys.contains(k) } as int
     if (srMatchedNotRead) srWarnings << "Time limit reached: usage files for ${srMatchedNotRead} script(s) were not read. Those scripts are shown as \"Not read\", never as unused. Re-run with a larger time limit.".toString()
-    if (srUnmatchedNotRead) srWarnings << "${srUnmatchedNotRead} usage file ID(s) that match no configured script were not read (time limit). They are listed under \"Identify\" as not read, never as unused.".toString()
+    if (srUnmatchedNotRead) srWarnings << "${srUnmatchedNotRead} usage file ID(s) that match no configured script were not read (time limit). They are listed under \"Check first\" as not read, never as unused.".toString()
     if (srUnreadableKeys) srWarnings << "${srUnreadableKeys.size()} usage file(s) could not be read. Those scripts are shown as \"Not read\", never as unused.".toString()
     if (srMissingDs) srWarnings << "${srMissingDs.size()} usage file(s) had no 'count' data source and were skipped (e.g. ${srMissingDs.take(3).join(', ')}). The file format may differ on this ScriptRunner version.".toString()
     lap('Reading usage files')
-    done("Usage files read: ${srRrdFiles} of ${srRrdFilesFound}  |  Value type: ${srRrdMeta.dsType ?: 'n/a'}")
+    log.warn "  Usage files read: ${srRrdFiles} of ${srRrdFilesFound} (${workers} worker(s)) | IDs judged from file date: ${srAgeJudged} | Value type: ${srRrdMeta.dsType ?: 'n/a'}"
 
     // Everything left on disk: REST endpoints, JQL functions, listeners, deleted scripts
     // Every usage file found is listed, read or not. Unread ones show as "Not read".
     (rrdKeysOnDisk - attributed).sort().each { String k ->
-        if (k ==~ REST_RE) {
+        if (srMap != null) {
+            // v2.2.0: no current ScriptRunner script has this ID.
+            if (SR_LISTENER_NAMES.containsKey(k)) addRow('Script Listener', SR_LISTENER_NAMES[k], 'Scope not listed for listeners', k, true)
+            else addRow(SR_LEFTOVER_TYPE, k, 'No current ScriptRunner script found with this ID: most likely left over from a deleted or changed script', k, true)
+        } else if (k ==~ REST_RE) {
             addRow('REST Endpoint', k, 'Not project-scoped', k, true)
         } else if (k ==~ UUID_RE) {
             if (SR_LISTENER_NAMES.containsKey(k)) addRow('Script Listener', SR_LISTENER_NAMES[k], 'Scope not listed for listeners', k, true)
@@ -588,7 +800,7 @@ try {
     // ── Step 4: judge every script now that usage has been read ──
     srPending.each { Map p -> finalizeRow(p) }
 
-    if (srListCut) srWarnings << "Time limit reached while listing ${srListCut.join(' and ')}: some are not listed. Their usage files show under \"Identify\", never as unused.".toString()
+    if (srListCut) srWarnings << "Time limit reached while listing ${srListCut.join(' and ')}: some are not listed. Their usage files show under \"Check first\", never as unused.".toString()
     def byStatus = srRows.countBy { it.status }
     done("Scripts: ${srRows.size()}  |  " + ['ACTIVE', 'DORMANT', 'NEVER RUN', 'NO DATA', 'NOT TRACKED']
             .collect { "${it}: ${byStatus[it] ?: 0}" }.join('  |  '))
@@ -607,7 +819,8 @@ try {
 // ═══════════════════════════════════════════════════════════════════════════
 // REPORT DATA
 // ═══════════════════════════════════════════════════════════════════════════
-def srIsUnmatched = { Map r -> (r.type as String).startsWith('Not matched') }
+def srIsLeftover  = { Map r -> (r.type as String) == SR_LEFTOVER_TYPE }
+def srIsUnmatched = { Map r -> (r.type as String).startsWith('Not matched') || srIsLeftover(r) }
 int srUnattributed = srRows.count { srIsUnmatched(it) } as int
 int srScripts      = srRows.size() - srUnattributed
 
@@ -633,12 +846,12 @@ def srByType = srRows.groupBy { it.type as String }.collect { String type, List 
 }.sort { -(it.total as int) }
 
 long RUN_END = System.currentTimeMillis()
-log.info "============================================================"
-log.info "  DATA COLLECTION COMPLETE in ${String.format('%.1f', (RUN_END - RUN_START) / 1000d)}s"
-log.info "  Time per step: ${phasesText()}"
-log.info "  Usage files read: ${srRrdFiles} of ${srRrdFilesFound}"
-log.info "  See the HTML result panel for the full report."
-log.info "============================================================"
+log.warn "============================================================"
+log.warn "  DATA COLLECTION COMPLETE in ${String.format('%.1f', (RUN_END - RUN_START) / 1000d)}s"
+log.warn "  Time per step: ${phasesText()}"
+log.warn "  Usage files read: ${srRrdFiles} of ${srRrdFilesFound} | IDs judged from file date: ${srAgeJudged}"
+log.warn "  See the HTML result panel for the full report."
+log.warn "============================================================"
 
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -650,6 +863,9 @@ log.info "============================================================"
 def srGroupOf = { Map r ->
     // Unmatched usage files are not scripts: they always need identifying first.
     if ((r.type as String).startsWith('Not matched')) return 'IDENTIFY'
+    // v2.2.0: left over from a script that no longer exists. No action only when read and no
+    // recent run; a recent run or unread file needs checking (fail safe).
+    if (srIsLeftover(r)) return r.status in ['DORMANT', 'NEVER RUN'] ? 'LEFTOVER' : 'LEFTCHECK'
     if (r.status in ['DORMANT', 'NEVER RUN']) return 'RETIRE'
     if (r.status == 'NOT READ') return 'NOTREAD'
     if (r.status == 'ACTIVE') return 'INUSE'
@@ -670,9 +886,15 @@ List<Map> SR_GROUPS = [
         [key: 'NOTREAD', decision: 'CHECK', word: 'NOT READ', colour: '#DFE1E6', text: '#172B4D', title: 'Check first: usage not read',
          action: 'Check first: fix the problem shown and re-run',
          explain: 'Usage could not be read, so it is unknown, not zero. See Problems in this run at the top for the fix, then re-run.'],
-        [key: 'NODATA', decision: 'CHECK', word: 'NO DATA', colour: '#DFE1E6', text: '#172B4D', title: 'Check first: no usage data',
+        [key: 'NODATA', decision: 'CHECK', word: 'NO DATA', colour: '#C1C7D0', text: '#172B4D', title: 'Check first: no usage data',
          action: 'Check first: ask the owner',
-         explain: 'A type ScriptRunner does not record usage for (e.g. Behaviours), or a workflow condition with no recorded run. Usage is unknown, not zero. Ask the owner whether it is still needed.'],
+         explain: 'A behaviour with no recorded run for any of its scripts, or a workflow condition with no recorded run. Usage is unknown, not zero. Ask the owner whether it is still needed.'],
+        [key: 'LEFTCHECK', decision: 'CHECK', word: 'LEFT OVER?', colour: '#8777D9', text: '#FFFFFF', title: 'Check first: left over, but ran recently or not read',
+         action: 'Check first: confirm the script was deleted',
+         explain: "Usage files whose ID matches no current ScriptRunner script, that ran in the last ${SR_DAYS_TXT} or could not be read. Usually a script deleted or changed recently. Check before ignoring.".toString()],
+        [key: 'LEFTOVER', decision: 'NONE', word: 'LEFT OVER', colour: '#B3D4FF', text: '#172B4D', title: 'No action: left over from deleted or changed scripts',
+         action: 'No action: left-over usage file',
+         explain: "Usage files whose ID matches no current ScriptRunner script, with no run in the last ${SR_DAYS_TXT}. Most likely left over: ScriptRunner keeps these files after a script is deleted or changed. Nothing to convert, archive or delete in ScriptRunner. If you recognise one as a current script, treat it as Archive or delete.".toString()],
 ]
 Map<String, List<Map>> srRowsByGroup = SR_GROUPS.collectEntries { [(it.key): []] }
 srRows.each { Map r -> srRowsByGroup[srGroupOf(r)] << r }
@@ -715,6 +937,8 @@ if (srUnreadableKeys) problems << [level: 'warn', what: "${srUnreadableKeys.size
         fix: 'Usually a file being written at that moment: re-run. If the same files fail again, send the Jira log to your Adaptavist contact.']
 if (srMissingDs) problems << [level: 'warn', what: "${srMissingDs.size()} usage file(s) were in an unexpected format and were skipped.".toString(),
         fix: "This ScriptRunner version (${srVersion}) may store usage differently. Send this report to your Adaptavist contact.".toString()]
+if (srMap == null && srMapError && !srFailed && !srRrdUnavailable) problems << [level: 'info', what: "ScriptRunner's own script list could not be read (${srMapError}).".toString(),
+        fix: 'Listeners are not named and left-over usage files are not separated. Name listeners with option 3, or send this report to your Adaptavist contact.']
 if (TIME_BUDGET_CAPPED) problems << [level: 'info', what: "The time limit asked for was above ${TIME_BUDGET_MAX_SEC}s, so ${TIME_BUDGET_MAX_SEC}s was used.".toString(),
         fix: 'The browser usually gives up long before that, losing the report. If your proxy waits longer, raise TIME_BUDGET_MAX_SEC in the script\'s advanced settings.']
 
@@ -841,9 +1065,13 @@ reportHtml = OutputFormatter.markupBuilder { builder ->
             // Decision summary: the three answers the customer needs
             int nKeep    = srRowsByGroup['INUSE'].size()
             int nArchive = srRowsByGroup['RETIRE'].size()
-            int nCheck   = srRowsByGroup['IDENTIFY'].size() + srRowsByGroup['NOTREAD'].size() + srRowsByGroup['NODATA'].size()
+            int nCheck   = srRowsByGroup['IDENTIFY'].size() + srRowsByGroup['NOTREAD'].size() + srRowsByGroup['NODATA'].size() + srRowsByGroup['LEFTCHECK'].size()
+            int nLeft    = srRowsByGroup['LEFTOVER'].size()
+            int nLeftAll = srRows.count { srIsLeftover(it) } as int
             p(style: 'font-size:13px;margin:0 0 8px') {
-                mkp.yield "${srScripts} ScriptRunner scripts found" + (srUnattributed ? ", plus ${srUnattributed} usage files not matched to a script" : '') +
+                mkp.yield "${srScripts} ScriptRunner scripts found" +
+                        (nLeftAll ? ", plus ${nLeftAll} usage files most likely left over from deleted or changed scripts" : '') +
+                        ((srUnattributed - nLeftAll) ? ", plus ${srUnattributed - nLeftAll} usage files not matched to a script" : '') +
                         ". Based on usage in the last ${SR_DAYS_TXT}:"
             }
             def tile = { String colour, String bgc, int n, String label, String sub ->
@@ -857,6 +1085,7 @@ reportHtml = OutputFormatter.markupBuilder { builder ->
                 tile('#00875A', '#E3FCEF', nKeep, 'Keep', "Ran in the last ${SR_DAYS_TXT}. Keep and convert with ScriptRunner Migration Suite.".toString())
                 tile('#FF8B00', '#FFFAE6', nArchive, 'Archive or delete', "No run in the last ${SR_DAYS_TXT}. If the owner agrees, archive (disable) or delete on Data Center before export.".toString())
                 tile('#6B778C', '#F4F5F7', nCheck, 'Check first', 'Usage unknown. Do not archive or delete until checked.')
+                if (nLeft) tile('#4C9AFF', '#F4F8FF', nLeft, 'No action: left over', "Usage files of scripts that no longer exist, with no run in the last ${SR_DAYS_TXT}. Nothing to do in ScriptRunner.".toString())
             }
             // Bar: same groups, same colours, same order as the lists below
             if (srNotReadKeys || srUnreadableKeys || srRrdUnavailable || srNodesMissing || srClusterCheckFailed || srListCut || srFailed) {
@@ -894,14 +1123,14 @@ reportHtml = OutputFormatter.markupBuilder { builder ->
                         long dy = y.daysAgo == null ? Long.MAX_VALUE : (y.daysAgo as long)
                         return (dy <=> dx) ?: (x.name as String) <=> (y.name as String)
                     }
-                    if (g.key in ['INUSE', 'IDENTIFY']) {
+                    if (g.key in ['INUSE', 'IDENTIFY', 'LEFTCHECK', 'LEFTOVER']) {
                         long ax = x.daysAgo == null ? Long.MAX_VALUE : (x.daysAgo as long)
                         long ay = y.daysAgo == null ? Long.MAX_VALUE : (y.daysAgo as long)
                         return ((y.sortDays as int) <=> (x.sortDays as int)) ?: (ax <=> ay) ?: (x.name as String) <=> (y.name as String)
                     }
                     return (x.type as String) <=> (y.type as String) ?: (x.name as String) <=> (y.name as String)
                 }
-                String sortNote = g.key == 'RETIRE' ? 'Longest unused first.' : (g.key in ['INUSE', 'IDENTIFY'] ? 'Ran on the most days first, then most recent.' : '')
+                String sortNote = g.key == 'RETIRE' ? 'Longest unused first.' : (g.key in ['INUSE', 'IDENTIFY', 'LEFTCHECK', 'LEFTOVER'] ? 'Ran on the most days first, then most recent.' : '')
                 String edge = g.colour == '#DFE1E6' ? '#6B778C' : (g.colour as String)
                 mkp.yieldUnescaped("<details class='mri-sub mri-group' style='border-left-color:${edge}'" + (g.key == 'RETIRE' ? ' open' : '') +
                         "><summary data-open='Show list (${rs.size()})' data-close='Hide list'>" + groupPill(g) + '&nbsp; ')
@@ -957,7 +1186,7 @@ reportHtml = OutputFormatter.markupBuilder { builder ->
                     moreNote(rs.size(), 'Use "Copy the full list" below to get every script.')
                     if (g.key == 'RETIRE') {
                         div(style: 'margin:10px 0 2px;padding:6px 10px;background:#DEEBFF;border-radius:4px;font-size:13px;font-weight:bold') {
-                            mkp.yield "End of the Archive or delete list. More groups below: Keep (${nKeep}), Check first (${nCheck}). Click a bar to open it. ↓".toString()
+                            mkp.yield ("End of the Archive or delete list. More groups below: Keep (${nKeep}), Check first (${nCheck})" + (nLeft ? ", No action: left over (${nLeft})" : '') + '. Click a bar to open it. ↓').toString()
                         }
                     }
                 }
@@ -1008,10 +1237,10 @@ reportHtml = OutputFormatter.markupBuilder { builder ->
             subGroup('How this data was collected, and its limits', 1) {
                 p(class: 'mri-hint') {
                     mkp.yield "Read from ScriptRunner's own execution files (the same data behind the SR Performance tab). " +
-                            "Nodes read: ${srNodeNames.join(', ') ?: 'none'}. Usage files found: ${srRrdFilesFound}, read: ${srRrdFiles}" +
+                            "Nodes read: ${srNodeNames.join(', ') ?: 'none'}. Usage files found: ${srRrdFilesFound}, read: ${srRrdFiles}, usage IDs judged from file date: ${srAgeJudged}" +
                             (srMatchedNotRead ? ", scripts not read (time limit): ${srMatchedNotRead}" : '') +
                             (srUnmatchedNotRead ? ", unmatched IDs not read (time limit): ${srUnmatchedNotRead}" : '') + '. ' +
-                            'Usage files of scripts are read first (including REST endpoints and JQL functions); IDs that match no script are read only if time remains. ' +
+                            'Usage files of scripts are read first, newest first; IDs that match no current script are read only if time remains. ' +
                             (srRrdMeta.dsType
                                     ? "Days it ran come from ScriptRunner's ${srRrdMeta.fineStep}s and ${srRrdMeta.dailyStep}s rows: any row with a run counts that day once. " +
                                       "Run counts are not shown, because the way ScriptRunner stores them cannot be turned back into an exact number of runs. " +
@@ -1026,8 +1255,12 @@ reportHtml = OutputFormatter.markupBuilder { builder ->
                     li { mkp.yield 'The report shows on how many days a script ran, not how many times. ScriptRunner\'s stored data cannot give an exact run count, so none is shown. A failed run still counts as a run.' }
                     li { mkp.yield 'Runs from the last few minutes may not show yet; the SR Performance tab is real-time.' }
                     li { mkp.yield 'Days and dates are UTC calendar days. A run within about 5 minutes of midnight UTC may count on the next day. Last run is a date only (no time of day), and looks back as far as ScriptRunner keeps data — up to 2 years in this report. "No run recorded" means no run was found in that period.' }
-                    li { mkp.yield 'Listeners cannot be listed by API, so they appear under "Not matched" unless named (form option 3). Listeners that never ran do not appear. "Not matched" can also include other ScriptRunner features and deleted scripts, so it is not a list of listeners.' }
+                    li { mkp.yield (srMap != null
+                            ? 'Scripts are matched to usage files using ScriptRunner\'s own list (the list behind its execution history), so listeners are named automatically, including ones that never ran. ScriptRunner keeps a script\'s usage file after the script is deleted or its ID changes (for example when a workflow is copied), so files matching no current script are shown as "Left over".'
+                            : 'ScriptRunner\'s own script list could not be read, so listeners appear under "Not matched" unless named (form option 3). Listeners that never ran do not appear. "Not matched" can also include other ScriptRunner features and deleted scripts, so it is not a list of listeners.') as String }
                     li { mkp.yield 'REST endpoints and JQL functions appear only once they have been called.' }
+                    li { mkp.yield "A usage file is only written when its script runs. A file not changed for over ${Math.max(SR_DORMANT_DAYS as int, 90)} days cannot hold a run in that time, so when there is no time to open it, it is judged from its file date (shown as \"file last changed\"). Left-over files of that age are not opened. Files are read newest first.".toString() }
+                    li { mkp.yield 'Behaviours: usage comes from the scripts inside each behaviour (initialiser and field scripts). A behaviour counts as run when any of its scripts ran. A behaviour with no recorded script run shows under "No usage data", not as unused.' }
                     li { mkp.yield 'Not included: Script Fragments, Mail Handlers, Resources and built-in scripts (no usage data is collected for them). Workflow conditions show usage only where ScriptRunner has recorded it.' }
                     li { mkp.yield '"Projects / scope" is where a script is configured to apply, not which projects triggered each run.' }
                     li { mkp.yield 'Usage says nothing about how a script moves to Cloud. ScriptRunner Migration Suite Analyse and Assess shows that.' }
@@ -1059,7 +1292,7 @@ reportHtml = OutputFormatter.markupBuilder { builder ->
 
         // ═════ 3. ABOUT THIS RUN (reference) ═══════════════════════════════
         h2(style: 'color:#172B4D;font-size:16px;margin:22px 0 4px') { mkp.yield 'About this run' }
-        subGroup('Settings used, and what each one changed', 3) {
+        subGroup('Settings used, and what each one changed', 4) {
             table(class: 'aui', style: 'width:100%') {
                 thead { tr { th(scope: 'col', 'Setting'); th(scope: 'col', 'Value'); th(scope: 'col', 'What it meant for this report') } }
                 tbody {
@@ -1069,7 +1302,8 @@ reportHtml = OutputFormatter.markupBuilder { builder ->
                     row('Time per step', phasesText() ?: '—', 'How long each step took. Building and saving the report is in the Jira log (RUN COMPLETE line).')
                     row('Unused after', "${SR_DORMANT_DAYS} days".toString(), "Scripts with no recorded run in ${SR_DORMANT_DAYS} days are listed under \"Archive or delete\".")
                     row('Listener names', SR_LISTENER_NAMES ? "${SR_LISTENER_NAMES.size()} entered".toString() : 'none',
-                            SR_LISTENER_NAMES ? 'Matching listeners are shown by name.' : 'Listeners (if any) are shown as "Not matched".')
+                            srMap != null ? 'Listeners are named from ScriptRunner\'s own list' + (SR_LISTENER_NAMES ? '; names entered here are used first.' : '.')
+                                    : (SR_LISTENER_NAMES ? 'Matching listeners are shown by name.' : 'Listeners (if any) are shown as "Not matched".'))
                 }
             }
         }
@@ -1116,7 +1350,7 @@ reportHtml = OutputFormatter.markupBuilder { builder ->
             String fmtTs = 'yyyy-MM-dd HH:mm:ss z'
             String stamp = "<div style='font-family:Arial,sans-serif;font-size:12px;color:#172B4D;background:#F4F5F7;border-radius:4px;padding:6px 10px;margin:0 auto 8px;max-width:1100px'>" +
                     "Run started ${new Date(RUN_START).format(fmtTs)}, finished ${new Date().format(fmtTs)}, on node ${nodeId.replaceAll(/[^A-Za-z0-9._:-]/, '')}. " +
-                    "Time limit ${TIME_BUDGET_SEC}s. Usage files read: ${srRrdFiles} of ${srRrdFilesFound}. Time per step: ${phasesText()}.</div>"
+                    "Time limit ${TIME_BUDGET_SEC}s. Usage files read: ${srRrdFiles} of ${srRrdFilesFound}. Usage IDs judged from file date: ${srAgeJudged}. Time per step: ${phasesText()}.</div>"
             File dir = SAVED_REPORT.parentFile
             dir.mkdirs()
             tmp = new File(dir, "last-report.${RUN_START}.tmp")
@@ -1126,13 +1360,13 @@ reportHtml = OutputFormatter.markupBuilder { builder ->
             } catch (AtomicMoveNotSupportedException ignored) {
                 Files.move(tmp.toPath(), SAVED_REPORT.toPath(), StandardCopyOption.REPLACE_EXISTING)
             }
-            log.info "  REPORT SAVED to ${SAVED_REPORT} (${(SAVED_REPORT.length() / 1024L) as long} KB). Option 4 shows it."
+            log.warn "  REPORT SAVED to ${SAVED_REPORT} (${(SAVED_REPORT.length() / 1024L) as long} KB). Option 4 shows it."
         } catch (Throwable se) {
             try { tmp?.delete() } catch (ignored) {}
             log.warn "  Report could not be saved to ${SAVED_REPORT}: ${se.message}. The report on screen is unaffected."
         }
     }
-    log.info "  RUN COMPLETE in ${String.format('%.1f', (System.currentTimeMillis() - RUN_START) / 1000d)}s  |  ${phasesText()}"
+    log.warn "  RUN COMPLETE in ${String.format('%.1f', (System.currentTimeMillis() - RUN_START) / 1000d)}s  |  ${phasesText()}"
     System.clearProperty(RUN_LOCK_KEY)
 }
 return reportHtml
