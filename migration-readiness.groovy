@@ -6,7 +6,10 @@
 // ⚠ BEST-EFFORT PROOF OF CONCEPT — NOT A SUPPORTED PRODUCT
 //   • Provided as-is, on a best-effort basis. Not maintained, not supported,
 //     and not an official Adaptavist or Atlassian tool. No warranty.
-//   • Read-only: makes no changes to Jira data or configuration.
+//   • Read-only for Jira: makes no changes to Jira data or configuration.
+//   • Writes one file: the finished report, saved to
+//     $JIRA_HOME/scriptrunner/migration-readiness/last-report.html
+//     (overwritten on each run). Nothing else is written.
 //   • No network calls.
 //   • Advice only: results are indicative, not authoritative. Verify before acting.
 //
@@ -25,18 +28,22 @@
 //   3. Read the HTML report below the console. Start with "Read this first".
 //   On a cluster, run it once, from any node. It reads every node's usage files.
 //
-// SAFETY BUILT IN (v2.0.0)
+// SAFETY BUILT IN (v2.1.0)
 //   • Only one run at a time per node: clicking Run again while a run is still going
 //     shows a "still running" message instead of starting a second run.
 //   • Maximum run time is capped at 300 seconds by default (TIME_BUDGET_MAX_SEC in
 //     ADVANCED SETTINGS). Only raise it if your proxy waits longer than that.
 //   • A check that fails is reported with a fix; the rest of the report still shows.
 //   • Unknown usage is never shown as unused.
+//   • The finished report is saved to a file, so it is not lost if the browser stops
+//     waiting. Type yes in option 4 to show it without running anything.
+//   • Scripts are listed first, then their usage files are read first, so time is not
+//     spent on files that match no configured script.
 //
 // IF SOMETHING GOES WRONG
-//   • Page hangs or goes blank: the run carries on on the server until it finishes.
-//     Do not click Run again. Wait 5 minutes, reload the console, paste, set a lower
-//     time limit (e.g. 40), then click Run once.
+//   • Page hangs, goes blank or says "Failed to post update": the run carries on on the
+//     server until it finishes. Do not click Run again. Wait for the time limit plus a few
+//     minutes, reload the console, paste, type yes in option 4, then click Run once.
 //   • "Another run is still in progress": wait the minutes shown, then run once.
 //   • Report shows "Problems in this run": each problem lists its fix.
 //   • Red error text instead of a report: copy it and send it to your Adaptavist contact.
@@ -65,6 +72,10 @@ import org.rrd4j.ConsolFun
 import org.rrd4j.core.FetchData
 import org.rrd4j.core.RrdDb
 
+import java.nio.file.AtomicMoveNotSupportedException
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+
 
 // ╔══════════════════════════════════════════════════════════════════════╗
 // ║  FORM — appears as fields above the Script Console when you paste    ║
@@ -76,7 +87,7 @@ import org.rrd4j.core.RrdDb
                 '(commonly after about 60 seconds), losing the result. After this many seconds the report stops reading, ' +
                 'shows what it has, and marks anything it did not read as "Not read" so you can re-run. ' +
                 'Effect: lower = safer but may leave scripts unread; higher = more complete but riskier. Blank = 50. Maximum 300 unless raised in the script\'s advanced settings (TIME_BUDGET_MAX_SEC). ' +
-                'Only go above 60 if your proxy or load balancer waits longer; otherwise the report is lost when the browser gives up.')
+                'Only go above 60 if your proxy or load balancer waits longer. If the browser gives up first, the run still finishes and saves its report: use option 4 to see it.')
 Integer FORM_TIME_BUDGET
 
 @NumberInput(label = '2. Treat a ScriptRunner script as unused after (days)',
@@ -90,6 +101,11 @@ Integer FORM_DORMANT_DAYS
                 'appear as "Not matched" in the report. Effect: entering names labels them properly. ' +
                 'Format: uuid=Name; uuid=Name. Find a UUID in SR admin → Listeners → Edit → the last part of the browser URL. Blank = skip.')
 String FORM_LISTENER_NAMES
+
+@ShortTextInput(label = '4. Show the last saved report instead of running (optional)',
+        description = 'Why we ask: if the page timed out or showed an error before the report appeared, the run usually still finished on the server and saved its report. ' +
+                'Effect: type yes to show that saved report straight away, without running anything. Blank = run normally.')
+String FORM_SHOW_LAST
 
 def  SR_DORMANT_DAYS = (FORM_DORMANT_DAYS && FORM_DORMANT_DAYS > 0) ? FORM_DORMANT_DAYS : 90
 Map<String, String> SR_LISTENER_NAMES = [:]
@@ -106,6 +122,8 @@ Map<String, String> SR_LISTENER_NAMES = [:]
 // proxy or load balancer stops waiting (often about 60 seconds), while the run keeps
 // using a Jira request thread. Raise only if you know your proxy waits longer.
 // Raising it also lengthens how long the one-run-at-a-time lock waits after a cut-short run.
+// Since v2.1.0 the finished report is also saved to a file (form option 4 shows it), so a
+// report lost by the browser can still be seen once the run finishes.
 int  TIME_BUDGET_MAX_SEC = 300
 int  TIME_BUDGET_SEC = (FORM_TIME_BUDGET && FORM_TIME_BUDGET > 0) ? Math.min(FORM_TIME_BUDGET as int, TIME_BUDGET_MAX_SEC) : 50
 boolean TIME_BUDGET_CAPPED = FORM_TIME_BUDGET && FORM_TIME_BUDGET > TIME_BUDGET_MAX_SEC
@@ -121,6 +139,17 @@ def MAX_ROWS = 50
 final long RUN_START = System.currentTimeMillis()
 def elapsedSec  = { -> ((System.currentTimeMillis() - RUN_START) / 1000L) as long }
 def overBudget  = { -> elapsedSec() >= TIME_BUDGET_SEC }
+// v2.1.0: the time limit covers the whole run. Listing scripts gets at most 30% of it, and
+// reading stops early enough to leave time to build and save the report.
+long LIST_BUDGET_SEC   = Math.max(10L, (long) (TIME_BUDGET_SEC * 0.3d))
+long BUILD_RESERVE_SEC = Math.min(30L, Math.max(5L, (long) (TIME_BUDGET_SEC * 0.1d)))
+def overListBudget = { -> elapsedSec() >= LIST_BUDGET_SEC }
+def overReadBudget = { -> elapsedSec() >= TIME_BUDGET_SEC - BUILD_RESERVE_SEC }
+// Time per step, shown in the report and the log (helps compare runs and instances).
+Map<String, Double> srPhaseSec = [:]
+long srLapStart = RUN_START
+def lap = { String step -> long now = System.currentTimeMillis(); srPhaseSec[step] = (now - srLapStart) / 1000d; srLapStart = now }
+def phasesText = { -> srPhaseSec.collect { String k, Double v -> "${k} ${String.format('%.1f', v)}s" }.join('  |  ') }
 
 // ── One run at a time (per node) ─────────────────────────────────────────────
 // Closing or reloading the browser does NOT stop a run: it carries on on the server.
@@ -131,19 +160,54 @@ def overBudget  = { -> elapsedSec() >= TIME_BUDGET_SEC }
 final String RUN_LOCK_KEY = 'adaptavist.srMigrationReadiness.runningSince'
 final long   RUN_LOCK_MAX_AGE_MS = (TIME_BUDGET_MAX_SEC + 300) * 1000L   // the cap plus 5 minutes (10 minutes by default)
 String prevRunStart = System.getProperty(RUN_LOCK_KEY)
-if (prevRunStart?.isLong() && (RUN_START - prevRunStart.toLong()) < RUN_LOCK_MAX_AGE_MS) {
-    long waitMin = Math.max(1L, (long) Math.ceil((RUN_LOCK_MAX_AGE_MS - (RUN_START - prevRunStart.toLong())) / 60000d))
-    log.warn "Another run of this report is still in progress on this node (started ${new Date(prevRunStart.toLong())}). Not starting a second one."
+boolean runInProgress = prevRunStart?.isLong() && (RUN_START - prevRunStart.toLong()) < RUN_LOCK_MAX_AGE_MS
+
+// ── Saved report (v2.1.0) ────────────────────────────────────────────────────
+// Each finished run saves its report to one file in the Jira home, overwritten each time.
+// If the browser stops waiting, the run still finishes on the server, and option 4 shows it.
+File srJiraHome   = ComponentAccessor.getComponent(JiraHome).home
+File SAVED_REPORT = new File(srJiraHome, 'scriptrunner/migration-readiness/last-report.html')
+def showSaved = { String note ->
+    if (!SAVED_REPORT.isFile()) return null
+    String saved = SAVED_REPORT.getText('UTF-8')
+    String when  = new Date(SAVED_REPORT.lastModified()).format('yyyy-MM-dd HH:mm:ss z')
+    return OutputFormatter.markupBuilder {
+        div(style: 'font-family:Arial,sans-serif;border:2px solid #0052CC;background:#F4F8FF;border-radius:6px;padding:12px 16px;max-width:1100px;margin:0 auto 12px') {
+            div(style: 'font-size:18px;font-weight:bold;margin-bottom:6px') { mkp.yield "Saved report from ${when}".toString() }
+            p(style: 'margin:4px 0') { mkp.yield note }
+            p(style: 'margin:4px 0;font-size:12px;color:#5E6C84') { mkp.yield "Shown from ${SAVED_REPORT}. Nothing was run. Clear option 4 and click Run for a new report.".toString() }
+        }
+        mkp.yieldUnescaped(saved)
+    }
+}
+if ((FORM_SHOW_LAST ?: '').trim().toLowerCase(Locale.ENGLISH) in ['yes', 'y', 'true', '1']) {
+    String note = runInProgress
+            ? "A run started at ${new Date(prevRunStart.toLong()).format('HH:mm:ss')} is still going on this node. This saved report is from an EARLIER run, not the one in progress.".toString()
+            : 'No run is in progress on this node.'
+    def savedHtml = showSaved(note)
+    if (savedHtml) return savedHtml
     return OutputFormatter.markupBuilder {
         div(style: 'font-family:Arial,sans-serif;border:2px solid #FF8B00;background:#FFFAE6;border-radius:6px;padding:12px 16px;max-width:760px') {
+            mkp.yield "No saved report was found (${SAVED_REPORT}). Clear option 4 and click Run once.".toString()
+        }
+    }
+}
+
+if (runInProgress) {
+    long waitMin = Math.max(1L, (long) Math.ceil((RUN_LOCK_MAX_AGE_MS - (RUN_START - prevRunStart.toLong())) / 60000d))
+    log.warn "Another run of this report is still in progress on this node (started ${new Date(prevRunStart.toLong())}). Not starting a second one."
+    def lockMsg = OutputFormatter.markupBuilder {
+        div(style: 'font-family:Arial,sans-serif;border:2px solid #FF8B00;background:#FFFAE6;border-radius:6px;padding:12px 16px;max-width:760px;margin-bottom:12px') {
             div(style: 'font-size:15px;font-weight:bold;margin-bottom:6px') { mkp.yield 'Another run of this report is still in progress on this Jira node' }
             p(style: 'margin:4px 0') { mkp.yield "It started at ${new Date(prevRunStart.toLong()).format('HH:mm:ss')}. To protect Jira, a second run was not started." }
             ol(style: 'margin:4px 0;padding-left:20px') {
                 li { mkp.yield "Wait about ${waitMin} minute(s). An earlier run keeps going on the server even if its page was closed or timed out." }
-                li { mkp.yield 'Then click Run once. If the last run timed out, first set a lower time limit (option 1, e.g. 40).' }
+                li { mkp.yield 'Then type yes in option 4 and click Run to see its saved report. Nothing new is run.' }
             }
         }
     }
+    def savedHtml = showSaved("A run started at ${new Date(prevRunStart.toLong()).format('HH:mm:ss')} is still going. This saved report is from an EARLIER run, not the one in progress.".toString())
+    return savedHtml ? (lockMsg.toString() + savedHtml.toString()) : lockMsg
 }
 System.setProperty(RUN_LOCK_KEY, RUN_START.toString())
 
@@ -160,7 +224,7 @@ def warn     = { String msg -> log.warn "    ⚠ ${msg}" }
 def done     = { String msg -> log.info "    ✔ ${msg}" }
 
 log.info "============================================================"
-log.info "  SCRIPTRUNNER USAGE REPORT — BEST-EFFORT POC (v2.0.0)"
+log.info "  SCRIPTRUNNER USAGE REPORT — BEST-EFFORT POC (v2.1.0)"
 log.info "  ${new Date().format('yyyy-MM-dd HH:mm:ss z')}"
 log.info "============================================================"
 
@@ -201,6 +265,9 @@ Set<String> srListCut = [] as Set<String>        // script lists cut short by th
 boolean srFailed = false                         // the ScriptRunner check itself failed part-way
 String  srError  = null                          // error text when srFailed
 boolean srClusterCheckFailed = false             // the cluster node check could not run: usage on other nodes unknown
+int srRrdFilesFound    = 0                       // v2.1.0: usage files found on disk (read or not)
+int srMatchedNotRead   = 0                       // configured scripts with a usage file not read (time limit)
+int srUnmatchedNotRead = 0                       // usage file IDs matching no configured script, not read (time limit)
 try {
     log.info "[1] ScriptRunner usage (RRD)"
 
@@ -268,8 +335,12 @@ try {
         }
     }
 
+    // ── Step 1 (v2.1.0): find the usage files. Folder listing only: no file is opened. ──
+    // Scripts are listed next and matched against these names, so reading (the slow part)
+    // starts with the files that belong to configured scripts.
+    Map<String, List<File>> rrdFilesByKey = [:]
     try {
-        File rrdRoot = new File(ComponentAccessor.getComponent(JiraHome).home, 'scriptrunner/rrd')
+        File rrdRoot = new File(srJiraHome, 'scriptrunner/rrd')
         if (!rrdRoot.exists()) {
             srRrdUnavailable = true
             srWarnings << "RRD directory not found (${rrdRoot}). Usage unavailable, so no script is marked as unused.".toString()
@@ -280,17 +351,9 @@ try {
                 srNodeNames << (dir == rrdRoot ? '(flat layout)' : dir.name)
                 dir.listFiles()?.findAll { it.isFile() && it.name.endsWith('.rrd4j') }?.each { File f ->
                     String key = f.name.substring(0, f.name.length() - '.rrd4j'.length())
-                    if (overBudget()) { srBudgetHit = true; srNotReadKeys << key; return }
-                    srRrdFiles++
-                    Map r = readRrd(f) as Map
-                    // A file that exists but cannot be read means usage is unknown, not zero.
-                    if (r == null) { srUnreadableKeys << key; return }
-                    Map ex = rrd[key]
-                    // Nodes: days are combined (a day counts once, whichever node ran it).
-                    rrd[key] = ex == null ? r : [
-                            days  : ((ex.days as Set<Long>) + (r.days as Set<Long>)) as Set<Long>,
-                            last  : Math.max(ex.last as long, r.last as long),
-                    ]
+                    List<File> fs = rrdFilesByKey[key]
+                    if (fs == null) { fs = [] as List<File>; rrdFilesByKey[key] = fs }
+                    fs << f
                 }
             }
             // Cluster check: every node Jira knows about should have a usage folder. If any is missing,
@@ -321,29 +384,42 @@ try {
                 srClusterCheckFailed = true
                 srWarnings << "Could not check cluster nodes: ${e.message}. No script is marked as unused. Compare \"Nodes read\" with Jira admin → System → Clustering.".toString()
             }
-            if (srBudgetHit) srWarnings << "Time limit reached while reading usage files: ${srNotReadKeys.size()} file(s) were not read. Those scripts are shown as \"Not read\", never as unused. Re-run with a larger time limit.".toString()
-            if (srUnreadableKeys) srWarnings << "${srUnreadableKeys.size()} usage file(s) could not be read. Those scripts are shown as \"Not read\", never as unused.".toString()
-            if (srMissingDs) srWarnings << "${srMissingDs.size()} usage file(s) had no 'count' data source and were skipped (e.g. ${srMissingDs.take(3).join(', ')}). The file format may differ on this ScriptRunner version.".toString()
-            done("Nodes: ${srNodeNames.join(', ') ?: 'none'}  |  RRD files read: ${srRrdFiles}  |  Value type: ${srRrdMeta.dsType ?: 'n/a'}")
         }
     } catch (Exception e) {
         srRrdUnavailable = true
-        srWarnings << "RRD load failed: ${e.message}. No script is marked as unused.".toString()
+        srWarnings << "RRD folder could not be listed: ${e.message}. No script is marked as unused.".toString()
     }
+    Set<String> rrdKeysOnDisk = rrdFilesByKey.keySet()
+    srRrdFilesFound = (rrdFilesByKey.values().collect { List<File> fs -> fs.size() }.sum() ?: 0) as int
+    lap('Finding usage files')
+    done("Nodes: ${srNodeNames.join(', ') ?: 'none'}  |  Usage files found: ${srRrdFilesFound} (${rrdKeysOnDisk.size()} IDs)")
 
+    // ── Step 2: list configured scripts. Each one is recorded here and judged in step 4,
+    // once its usage has been read. ──
     Set<String> attributed = [] as Set<String>
+    List<Map> srPending = [] as List<Map>
     def addRow = { String type, String name, String where, String key, boolean tracked ->
-        Map d = key ? rrd[key] : null
         if (key) attributed << key
+        srPending << [type: type, name: name, where: where, key: key, tracked: tracked]
+    }
+    def finalizeRow = { Map p ->
+        String type = p.type as String; String name = p.name as String; String where = p.where as String
+        String key = p.key as String; boolean tracked = p.tracked as boolean
+        Map d = key ? rrd[key] : null
+        boolean ranRecently = d != null && (d.last as long) > 0L &&
+                Math.floorDiv((d.last as long) - 1L, DAY) > todayKey - (SR_DORMANT_DAYS as long)
         String status
         if (!tracked)               status = 'NOT TRACKED'
+        // v2.1.0: a recent run in any file that WAS read proves the script is in use, even if
+        // another node's file for it was not read. Only "unused" needs every file.
+        else if (ranRecently)       status = 'ACTIVE'
         // Any unread file for this script (e.g. one node read, another cut off by the time limit)
         // means usage is incomplete, so it is never judged unused.
         else if (srRrdUnavailable || (key && (srNotReadKeys.contains(key) || srUnreadableKeys.contains(key)))) status = 'NOT READ'
         // No usage file and a file with no recorded run mean the same thing: no run found.
         else if (d == null || (d.last as long) == 0L) status = 'NEVER RUN'
-        else if (Math.floorDiv((d.last as long) - 1L, DAY) > todayKey - (SR_DORMANT_DAYS as long)) status = 'ACTIVE'
         else                        status = 'DORMANT'
+
         // A cluster node's usage folder is missing: "no run found" can't be trusted, so not judged unused.
         if ((srNodesMissing || srClusterCheckFailed) && status in ['DORMANT', 'NEVER RUN']) status = 'NOT READ'
         Set<Long> days  = d ? (d.days as Set<Long>) : ([] as Set<Long>)
@@ -377,14 +453,14 @@ try {
     try {
         Map<String, List<String>> wfToProjects = [:]
         projectManager.getProjectObjects().each { Project proj ->
-            if (overBudget()) { srListCut << 'workflow scripts'; return }
+            if (overListBudget()) { srListCut << 'workflow scripts'; return }
             wfSchemeManager.getWorkflowMap(proj).values().toUnique().each { String wfName ->
                 wfToProjects.get(wfName, []) << proj.key
             }
         }
         Set<String> seen = [] as Set<String>
         workflowManager.getWorkflows().each { JiraWorkflow wf ->
-            if (overBudget()) { srListCut << 'workflow scripts'; return }
+            if (overListBudget()) { srListCut << 'workflow scripts'; return }
             List<String> keys = (wfToProjects[wf.name] ?: []).unique().sort()
             String where = keys ? keys.join(', ') : (wf.active ? 'No projects' : 'Workflow inactive')
             // Adds one ScriptRunner workflow item. Conditions are only marked as having usage
@@ -398,7 +474,9 @@ try {
                 if (!cls.contains('onresolve') && !cls.contains('scriptrunner')) return
                 String fid = args['FIELD_FUNCTION_ID'] as String
                 if (fid && !seen.add(fid)) return
-                boolean tracked = fid != null && (!mustHaveFile || rrd.containsKey(fid))
+                // v2.1.0: checked against usage-file names found in step 1, so it works before any file is read,
+                // and a condition whose file was skipped by the time limit shows "Not read", not "No data".
+                boolean tracked = fid != null && (!mustHaveFile || rrdKeysOnDisk.contains(fid))
                 addRow(type, "${wf.name} → ${actionName}".toString(), where, fid, tracked)
             }
             Closure walkConditions
@@ -427,7 +505,7 @@ try {
                     (tk.contains('onresolve') || tk.contains('scriptrunner')) && !tk.contains('jqlFunctions')
                 }
                 .each { cf ->
-                    if (overBudget()) { srListCut << 'script fields'; return }
+                    if (overListBudget()) { srListCut << 'script fields'; return }
                     cf.getConfigurationSchemes().each { scheme ->
                         String where = scheme.isGlobal() ? 'All projects (global)'
                                 : (scheme.getAssociatedProjectObjects()*.key.sort().join(', ') ?: 'No projects')
@@ -449,11 +527,49 @@ try {
         srWarnings << "Behaviours could not be listed: ${e.message}".toString()
     }
 
-    // Everything left on disk: REST endpoints, JQL functions, listeners, deleted scripts
+    lap('Listing scripts')
+
+    // ── Step 3 (v2.1.0): read usage files. Scripts first: configured scripts, named listeners,
+    // and REST endpoints and JQL functions (which are known only by their file name).
+    // IDs that match no script (unnamed UUIDs, numbers, hashes) only if time remains. ──
     String UUID_RE = /[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/
     String REST_RE = /(?i)(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)-.+/
-    // Files that exist but were not read (time limit, unreadable) are listed too, as "Not read".
-    ((rrd.keySet() + srNotReadKeys + srUnreadableKeys) - attributed).sort().each { String k ->
+    String HASH_RE = /[0-9a-fA-F]{40}/
+    def isScriptKey = { String k ->
+        attributed.contains(k) || SR_LISTENER_NAMES.containsKey(k) || (k ==~ REST_RE) ||
+                !((k ==~ UUID_RE) || (k ==~ /\d+/) || (k ==~ HASH_RE))
+    }
+    List<String> matchedKeys   = rrdKeysOnDisk.findAll { String k -> isScriptKey(k) }.sort()
+    List<String> unmatchedKeys = rrdKeysOnDisk.findAll { String k -> !isScriptKey(k) }.sort()
+    def readKey = { String key ->
+        (rrdFilesByKey[key] ?: []).each { File f ->
+            if (overReadBudget()) { srBudgetHit = true; srNotReadKeys << key; return }
+            srRrdFiles++
+            Map r = readRrd(f) as Map
+            // A file that exists but cannot be read means usage is unknown, not zero.
+            if (r == null) { srUnreadableKeys << key; return }
+            Map ex = rrd[key]
+            // Nodes: days are combined (a day counts once, whichever node ran it).
+            rrd[key] = ex == null ? r : [
+                    days  : ((ex.days as Set<Long>) + (r.days as Set<Long>)) as Set<Long>,
+                    last  : Math.max(ex.last as long, r.last as long),
+            ]
+        }
+    }
+    matchedKeys.each { String k -> readKey(k) }
+    unmatchedKeys.each { String k -> readKey(k) }
+    srMatchedNotRead   = matchedKeys.count { String k -> srNotReadKeys.contains(k) } as int
+    srUnmatchedNotRead = unmatchedKeys.count { String k -> srNotReadKeys.contains(k) } as int
+    if (srMatchedNotRead) srWarnings << "Time limit reached: usage files for ${srMatchedNotRead} script(s) were not read. Those scripts are shown as \"Not read\", never as unused. Re-run with a larger time limit.".toString()
+    if (srUnmatchedNotRead) srWarnings << "${srUnmatchedNotRead} usage file ID(s) that match no configured script were not read (time limit). They are listed under \"Identify\" as not read, never as unused.".toString()
+    if (srUnreadableKeys) srWarnings << "${srUnreadableKeys.size()} usage file(s) could not be read. Those scripts are shown as \"Not read\", never as unused.".toString()
+    if (srMissingDs) srWarnings << "${srMissingDs.size()} usage file(s) had no 'count' data source and were skipped (e.g. ${srMissingDs.take(3).join(', ')}). The file format may differ on this ScriptRunner version.".toString()
+    lap('Reading usage files')
+    done("Usage files read: ${srRrdFiles} of ${srRrdFilesFound}  |  Value type: ${srRrdMeta.dsType ?: 'n/a'}")
+
+    // Everything left on disk: REST endpoints, JQL functions, listeners, deleted scripts
+    // Every usage file found is listed, read or not. Unread ones show as "Not read".
+    (rrdKeysOnDisk - attributed).sort().each { String k ->
         if (k ==~ REST_RE) {
             addRow('REST Endpoint', k, 'Not project-scoped', k, true)
         } else if (k ==~ UUID_RE) {
@@ -461,10 +577,16 @@ try {
             else addRow('Not matched to a configured script', k, 'Could be a listener, another ScriptRunner feature, or a deleted script', k, true)
         } else if (k ==~ /\d+/) {
             addRow('Not matched to a configured script', k, 'Numeric ID: could be a deleted script field', k, true)
+        } else if (k ==~ HASH_RE) {
+            // v2.1.0: 40-character hash IDs were labelled JQL Function; what they are is not confirmed.
+            addRow('Not matched to a configured script', k, 'Hash-style ID: could be a JQL function or another ScriptRunner feature', k, true)
         } else {
             addRow('JQL Function', k, 'Not project-scoped', k, true)
         }
     }
+
+    // ── Step 4: judge every script now that usage has been read ──
+    srPending.each { Map p -> finalizeRow(p) }
 
     if (srListCut) srWarnings << "Time limit reached while listing ${srListCut.join(' and ')}: some are not listed. Their usage files show under \"Identify\", never as unused.".toString()
     def byStatus = srRows.countBy { it.status }
@@ -513,6 +635,8 @@ def srByType = srRows.groupBy { it.type as String }.collect { String type, List 
 long RUN_END = System.currentTimeMillis()
 log.info "============================================================"
 log.info "  DATA COLLECTION COMPLETE in ${String.format('%.1f', (RUN_END - RUN_START) / 1000d)}s"
+log.info "  Time per step: ${phasesText()}"
+log.info "  Usage files read: ${srRrdFiles} of ${srRrdFilesFound}"
 log.info "  See the HTML result panel for the full report."
 log.info "============================================================"
 
@@ -582,9 +706,11 @@ if (srNodesMissing) problems << [level: 'warn', what: "No usage folder was found
 if (srClusterCheckFailed) problems << [level: 'warn', what: 'The list of cluster nodes could not be checked, so no script is marked as unused.',
         fix: 'Compare "Nodes read" (under "How this data was collected") with Jira admin → System → Clustering, then re-run. If it happens again, send this report to your Adaptavist contact.']
 if (srBudgetHit || srListCut) problems << [level: 'warn',
-        what: ([srBudgetHit ? "${srNotReadKeys.size()} usage file(s) not read" : null,
+        what: ([srMatchedNotRead ? "usage of ${srMatchedNotRead} script(s) not read" : null,
+                srUnmatchedNotRead ? "${srUnmatchedNotRead} unmatched usage ID(s) not read" : null,
                 srListCut ? "some ${srListCut.join(' and ')} not listed" : null].findAll().join(', ') + " — the ${TIME_BUDGET_SEC}s time limit was reached.").toString(),
-        fix: "Raise the time limit (option 1, up to ${TIME_BUDGET_MAX_SEC}s) and re-run, off-peak.".toString()]
+        fix: ("Raise the time limit (option 1, up to ${TIME_BUDGET_MAX_SEC}s) and re-run, off-peak. " +
+              'If the page times out before the report appears, wait for the run to finish, then type yes in option 4 to see the saved report.').toString()]
 if (srUnreadableKeys) problems << [level: 'warn', what: "${srUnreadableKeys.size()} usage file(s) could not be read. Those scripts show as \"Not read\".".toString(),
         fix: 'Usually a file being written at that moment: re-run. If the same files fail again, send the Jira log to your Adaptavist contact.']
 if (srMissingDs) problems << [level: 'warn', what: "${srMissingDs.size()} usage file(s) were in an unexpected format and were skipped.".toString(),
@@ -694,7 +820,7 @@ reportHtml = OutputFormatter.markupBuilder { builder ->
                 }
             }
             p(style: 'font-size:11px;color:#5E6C84;margin:0') {
-                mkp.yield 'Best-effort proof of concept: not supported or maintained, read-only (nothing was changed), results indicative.'
+                mkp.yield "Best-effort proof of concept: not supported or maintained, read-only for Jira (nothing in Jira was changed), results indicative. Saves this report to ${SAVED_REPORT}.".toString()
             }
             div(style: 'font-size:13px;margin:8px 0 0;padding:6px 10px;background:#DEEBFF;border-radius:4px') {
                 b('How to use this page: ')
@@ -882,8 +1008,10 @@ reportHtml = OutputFormatter.markupBuilder { builder ->
             subGroup('How this data was collected, and its limits', 1) {
                 p(class: 'mri-hint') {
                     mkp.yield "Read from ScriptRunner's own execution files (the same data behind the SR Performance tab). " +
-                            "Nodes read: ${srNodeNames.join(', ') ?: 'none'}. Files read: ${srRrdFiles}" +
-                            (srNotReadKeys ? ", not read (time limit): ${srNotReadKeys.size()}" : '') + '. ' +
+                            "Nodes read: ${srNodeNames.join(', ') ?: 'none'}. Usage files found: ${srRrdFilesFound}, read: ${srRrdFiles}" +
+                            (srMatchedNotRead ? ", scripts not read (time limit): ${srMatchedNotRead}" : '') +
+                            (srUnmatchedNotRead ? ", unmatched IDs not read (time limit): ${srUnmatchedNotRead}" : '') + '. ' +
+                            'Usage files of scripts are read first (including REST endpoints and JQL functions); IDs that match no script are read only if time remains. ' +
                             (srRrdMeta.dsType
                                     ? "Days it ran come from ScriptRunner's ${srRrdMeta.fineStep}s and ${srRrdMeta.dailyStep}s rows: any row with a run counts that day once. " +
                                       "Run counts are not shown, because the way ScriptRunner stores them cannot be turned back into an exact number of runs. " +
@@ -938,6 +1066,7 @@ reportHtml = OutputFormatter.markupBuilder { builder ->
                     def row = { String k, String v, String m -> tr { td { b(k) }; td(v); td(m) } }
                     row('Maximum run time', "${TIME_BUDGET_SEC}s".toString(), "The run took ${String.format('%.1f', (RUN_END - RUN_START) / 1000d)}s. " +
                             ((srBudgetHit || srListCut) ? 'The time limit was reached: see Problems in this run.' : 'The time limit was not reached.'))
+                    row('Time per step', phasesText() ?: '—', 'How long each step took. Building and saving the report is in the Jira log (RUN COMPLETE line).')
                     row('Unused after', "${SR_DORMANT_DAYS} days".toString(), "Scripts with no recorded run in ${SR_DORMANT_DAYS} days are listed under \"Archive or delete\".")
                     row('Listener names', SR_LISTENER_NAMES ? "${SR_LISTENER_NAMES.size()} entered".toString() : 'none',
                             SR_LISTENER_NAMES ? 'Matching listeners are shown by name.' : 'Listeners (if any) are shown as "Not matched".')
@@ -948,7 +1077,7 @@ reportHtml = OutputFormatter.markupBuilder { builder ->
         div(style: 'color:#5E6C84;font-size:11px;margin-top:20px;border-top:1px solid #DFE1E6;padding-top:8px') {
             b('About this report. ')
             mkp.yield 'Best-effort proof of concept: provided as-is, not maintained, not supported, and not an official Adaptavist or Atlassian tool. ' +
-                    'Read-only — no data or configuration was changed. Automated checks only; results are indicative, so verify before acting. ' +
+                    "Read-only for Jira: no Jira data or configuration was changed. One file is written: this report, saved to ${SAVED_REPORT} and overwritten on each run. Automated checks only; results are indicative, so verify before acting. " +
                     'It does not replace Atlassian\'s Jira pre-migration checklist or the Jira Cloud Migration Assistant (JCMA). '
             extLink('https://support.atlassian.com/migration/docs/jira-pre-migration-checklist/', 'Atlassian pre-migration checklist')
         }
@@ -973,6 +1102,37 @@ reportHtml = OutputFormatter.markupBuilder { builder ->
         }
     }
 } finally {
+    // ── Save the report (v2.1.0): written under a temporary name, then renamed, so a
+    // half-written file is never shown. A failed save never affects the report on screen.
+    lap('Building the report')
+    if (reportHtml) {
+        File tmp = null
+        try {
+            String nodeId = 'single node'
+            try {
+                def cm = ComponentAccessor.getComponent(com.atlassian.jira.cluster.ClusterManager)
+                if (cm?.isClustered()) nodeId = (cm.getNodeId() ?: 'unknown') as String
+            } catch (ignored) {}
+            String fmtTs = 'yyyy-MM-dd HH:mm:ss z'
+            String stamp = "<div style='font-family:Arial,sans-serif;font-size:12px;color:#172B4D;background:#F4F5F7;border-radius:4px;padding:6px 10px;margin:0 auto 8px;max-width:1100px'>" +
+                    "Run started ${new Date(RUN_START).format(fmtTs)}, finished ${new Date().format(fmtTs)}, on node ${nodeId.replaceAll(/[^A-Za-z0-9._:-]/, '')}. " +
+                    "Time limit ${TIME_BUDGET_SEC}s. Usage files read: ${srRrdFiles} of ${srRrdFilesFound}. Time per step: ${phasesText()}.</div>"
+            File dir = SAVED_REPORT.parentFile
+            dir.mkdirs()
+            tmp = new File(dir, "last-report.${RUN_START}.tmp")
+            tmp.setText(stamp + reportHtml.toString(), 'UTF-8')
+            try {
+                Files.move(tmp.toPath(), SAVED_REPORT.toPath(), StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+            } catch (AtomicMoveNotSupportedException ignored) {
+                Files.move(tmp.toPath(), SAVED_REPORT.toPath(), StandardCopyOption.REPLACE_EXISTING)
+            }
+            log.info "  REPORT SAVED to ${SAVED_REPORT} (${(SAVED_REPORT.length() / 1024L) as long} KB). Option 4 shows it."
+        } catch (Throwable se) {
+            try { tmp?.delete() } catch (ignored) {}
+            log.warn "  Report could not be saved to ${SAVED_REPORT}: ${se.message}. The report on screen is unaffected."
+        }
+    }
+    log.info "  RUN COMPLETE in ${String.format('%.1f', (System.currentTimeMillis() - RUN_START) / 1000d)}s  |  ${phasesText()}"
     System.clearProperty(RUN_LOCK_KEY)
 }
 return reportHtml
