@@ -413,7 +413,7 @@ try {
             }
             // Cluster check: every node Jira knows about should have a usage folder. If any is missing,
             // usage on that node is unknown, so no script is judged unused (see addRow).
-            // ScriptRunner cleans up node IDs before using them as folder names (SRJIRA-4961), so
+            // ScriptRunner cleans up node IDs before using them as folder names, so
             // names are compared after removing everything except letters and digits.
             // Offline nodes are not required to have a folder: any folder they left is still read.
             try {
