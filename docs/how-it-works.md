@@ -2,7 +2,7 @@
 
 > Best-effort proof of concept. Not part of ScriptRunner and not covered by Adaptavist Support. It reads internal ScriptRunner data that may change between versions. Shows on how many days each script ran, not how many times. Verify before acting.
 
-This page describes version 2.3.0.
+This page describes version 2.4.0.
 
 ## Where the usage data comes from
 
@@ -168,7 +168,7 @@ Files are read by 4 parallel workers (`READ_THREADS` in the advanced settings,
 ## Rules that protect against wrong conclusions
 
 - **Unread is never unused.** If the time limit stops the read and the file is
-  recent, the script shows as "Not read", not "Archive or delete".
+  recent, the script shows as "Not read", not "Archive (disable)".
 - **Unreadable is never unused.** A recent usage file that can't be read puts that
   script under "Not read".
 - **A recent run wins.** A run in any file that was read shows the script as Keep,
@@ -202,12 +202,16 @@ Files are read by 4 parallel workers (`READ_THREADS` in the advanced settings,
 - **One run at a time per node.** A run keeps going on the server even if the
   browser gives up. A JVM system property marks a run in progress, so a second
   click shows a "still running" message (and the last saved report) instead of
-  starting another run. It clears at the end of the run, or after the time cap
-  plus 5 minutes if a run was cut short. It's per node: on a cluster, run it on one
+  starting another run. It clears at the end of the run, or after that run's own time
+  limit plus 5 minutes if a run was cut short. It's per node: on a cluster, run it on one
   node's own address rather than through the load balancer.
-- **Time limit capped at 300 seconds** by default (`TIME_BUDGET_MAX_SEC`, advanced
-  settings). The report travels back in the same browser request, so raise the cap
-  only if your proxy waits longer.
+- **Time limit set by option 1 only**, 50 seconds by default, up to 1200. The report
+  travels back in the same browser request, so a long run can lose the page; the run
+  still finishes and saves its report, which option 4 shows. A run uses one Jira
+  request thread for its whole time, so run long ones off-peak.
+- **Incomplete runs are flagged at the top.** If anything wasn't read, a banner says
+  so and points to the fix. Keep and Archive (disable) stay safe to use, because
+  anything unread is under Check first.
 - **Every check is wrapped**, including against out-of-memory errors, so one failure
   doesn't lose the whole report. If the report itself can't be drawn, a plain
   version with the decision lists is shown instead.
