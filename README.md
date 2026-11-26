@@ -19,8 +19,8 @@ It shows usage only. It never says whether a script can move to Cloud.
 
 ## Where it fits
 
-1. Run this report and review the "Archive or delete" list with script owners.
-2. Disable or delete scripts that are no longer needed.
+1. Run this report and review the "Archive (disable)" list with script owners.
+2. Disable scripts that are no longer needed. Delete only later, once nothing broke while they were disabled.
 3. Script Registry export ("Export active scripts only").
 4. [ScriptRunner Migration Suite Analyse and Assess](https://docs.adaptavist.com/sms/latest/scriptrunner-migration-suite-web-app/scriptrunner-migration-analyse-and-assess-tool) (always do this).
 5. Convert with the [ScriptRunner Migration Suite Migration Agent](https://docs.adaptavist.com/sms/latest/scriptrunner-migration-suite-web-app/scriptrunner-migration-agent), deploy with the [Dev and Deployment Tool](https://docs.adaptavist.com/sms/latest/scriptrunner-dev-and-deployment-tool).
@@ -55,23 +55,23 @@ Tip: run it on one node's own address rather than through the load balancer, so 
 
 | # | Option | Default | What it does |
 |---|---|---|---|
-| 1 | Maximum run time (seconds) | 50 | Browsers and proxies often give up after about 60 s. The report stops reading at this limit and marks anything unread as "Not read". Capped at 300 unless `TIME_BUDGET_MAX_SEC` is raised in the script. On large instances, use 300. |
+| 1 | Maximum run time (seconds) | 50 | Browsers and proxies often give up after about 60 s. The report stops reading at this limit and marks anything unread as "Not read". Up to 1200, set here only (no change inside the script). On large instances, use 300 or more, off-peak, on one node's own address (not through the load balancer). |
 | 2 | Treat a script as unused after (days) | 90 | Window for "days it ran". Widen it (e.g. 365) to catch quarterly or yearly scripts. |
 | 3 | Script Listener names | blank | Usually not needed: since 2.2.0 listeners are named automatically. Only use it if the report says ScriptRunner's own script list couldn't be read. Format: `uuid=Name; uuid=Name`. |
 | 4 | Show the last saved report | blank | Type `yes` to show the last saved report straight away, without running anything. Use it when the page timed out or showed an error before the report appeared. |
 
 ## Reading the report
 
-The top shows **Keep**, **Archive or delete**, **Check first**, and, when there are any, **No action: left over**. Below that, every row is in exactly one group:
+The top shows **Keep**, **Archive (disable)**, **Check first**, and, when there are any, **No action: left over**. Below that, every row is in exactly one group:
 
 | Group | Meaning | What to do |
 |---|---|---|
-| Archive or delete | No run recorded in the window. | Ask the owner if it's still needed. If not, disable it (keeps a copy) or delete it. |
+| Archive (disable) | No run recorded in the window. | Ask the owner if it's still needed. If not, disable it (keeps a copy). Delete only later. |
 | Keep | Ran at least once in the window. | Keep. Analyse and Assess decides how it moves. |
 | Check first: not read | Usage couldn't be read (e.g. time limit hit, cluster node missing). Unknown, not zero. | Follow the fix in "Problems in this run" and re-run. |
 | Check first: no data | A behaviour with no recorded run for any of its scripts, or a workflow condition with no recorded run. Unknown, not zero. | Check with the owner. |
 | Check first: left over, but ran recently or not read | A usage file whose ID matches no current ScriptRunner script, that ran in the window or couldn't be read. Usually a script deleted or changed recently. | Check it isn't a current script before ignoring it. |
-| No action: left over | A usage file whose ID matches no current ScriptRunner script, with no run in the window. ScriptRunner keeps these files after a script is deleted or changed. | Nothing to convert, archive or delete. If you recognise one as a current script, treat it as Archive or delete. |
+| No action: left over | A usage file whose ID matches no current ScriptRunner script, with no run in the window. ScriptRunner keeps these files after a script is deleted or changed. | Nothing to convert, archive or delete. If you recognise one as a current script, treat it as Archive (disable). |
 
 If ScriptRunner's own script list can't be read on your version, the report works as in 2.1.0 and shows a "Check first: identify" group instead of the left-over groups.
 
@@ -109,14 +109,29 @@ How the data is read, and why: [docs/how-it-works.md](docs/how-it-works.md).
 |---|---|
 | Page times out, goes blank, or says "Failed to post update" | Don't click Run again. The run carries on on the server and saves its report. Wait for the time limit plus a few minutes, then type `yes` in option 4 and click Run. |
 | Scripts show "Not read" | Follow the fix in "Problems in this run". If the time limit was reached, raise option 1 and re-run. |
-| Large instance: many rows "Not read" | Set option 1 to 300 and re-run, off-peak. Files are read newest first, so the most useful results come first. If the page times out, use option 4 after the time limit plus a few minutes. |
+| Large instance: many rows "Not read" | Raise option 1 (300 to 1200) and re-run once, off-peak, on one node's own address. Files are read newest first, so the most useful results come first. If the page times out, use option 4 after the time limit plus a few minutes. |
 | Many "left over" rows | Normal on older instances: ScriptRunner keeps usage files after scripts are deleted. Check only the "ran recently" ones. |
 | "No usage folder found for cluster node(s)" | A node in the cluster has no usage files, so nothing is marked unused. Check that node with your Jira administrator; a brand-new node that hasn't run a script yet also causes this. |
 | "RRD directory not found" | ScriptRunner usage files weren't found, so nothing is marked unused. Check ScriptRunner is installed and has run scripts. On a cluster, check the shared home is mounted on that node. |
 | "Another run is still in progress" | Wait the minutes shown. The last saved report (from an earlier run) is shown below the message, clearly dated. When the run finishes, use option 4 to see its report. |
 | "Report could not be saved" in the log | The Jira home folder isn't writable by Jira. The report on screen is unaffected. |
 
+## Before you act
+
+- Agree with each script's owner. Usage is not value: a script that runs once a quarter or once a year can be critical.
+- Check Scheduled Jobs and Escalation Services in the Archive list. One set to run less often than the window looks unused. Keep it.
+- Disable first. Wait at least one full business cycle (for example a quarter) before removing anything.
+- Delete only once nothing broke while it was disabled. Deleting cannot be undone.
+- If the top of the report says "Report incomplete", Keep and Archive (disable) are still safe to use. Anything not read is under Check first.
+
 ## Version
+
+2.4.0 (safer to act on):
+- Option 1 alone sets the run time, up to 1200 seconds. Nothing in the script needs editing.
+- The one-run-at-a-time lock expires after the run that set it (its time limit plus 5 minutes), not after the maximum.
+- A script judged from its file date shows as DORMANT (ran before, not in the window), not NEVER RUN: a usage file is only written when its script runs.
+- "Archive or delete" is now "Archive (disable)", with a "Before you act" checklist.
+- A banner at the top says when the report is incomplete, and that Keep and Archive (disable) are still safe to use.
 
 2.3.0 (large instances):
 - A usage file not changed for longer than the window (at least 90 days) can't hold a recent run, so when there's no time to open it, it's judged from its file date. Left-over files of that age are never opened.
