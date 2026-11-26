@@ -28,11 +28,12 @@
 //   3. Read the HTML report below the console. Start with "Read this first".
 //   On a cluster, run it once, from any node. It reads every node's usage files.
 //
-// SAFETY BUILT IN (v2.3.0)
+// SAFETY BUILT IN (v2.4.0)
 //   • Only one run at a time per node: clicking Run again while a run is still going
 //     shows a "still running" message instead of starting a second run.
-//   • Maximum run time is capped at 300 seconds by default (TIME_BUDGET_MAX_SEC in
-//     ADVANCED SETTINGS). Only raise it if your proxy waits longer than that.
+//   • Option 1 alone sets the run time (up to 1200 seconds). Nothing in the script needs
+//     editing. For long runs, open Jira on one node's own address, not through the load
+//     balancer, so the page is not cut off.
 //   • A check that fails is reported with a fix; the rest of the report still shows.
 //   • Unknown usage is never shown as unused.
 //   • The finished report is saved to a file, so it is not lost if the browser stops
@@ -58,6 +59,15 @@
 //   • Files are read newest first, in parallel (READ_THREADS in ADVANCED SETTINGS).
 //   • Listing scripts gets its own share of the time limit (finding files no longer uses it up).
 //   • Key progress lines are logged at WARN, so they reach atlassian-jira.log.
+//
+// NEW IN v2.4.0 (safer to act on)
+//   • No script edit needed: option 1 can go up to 1200 seconds on its own.
+//   • The one-run-at-a-time lock is sized to the run actually started, not the maximum.
+//   • A script judged from its file date is now DORMANT (ran before, not in the window): its
+//     usage file exists, so it ran at some point. It was wrongly labelled NEVER RUN.
+//   • "Archive or delete" is now "Archive (disable)". Disable first; delete only later.
+//   • A banner at the top says when the report is incomplete, and which lists are still
+//     safe to use.
 //
 // IF SOMETHING GOES WRONG
 //   • Page hangs, goes blank or says "Failed to post update": the run carries on on the
@@ -116,13 +126,13 @@ import java.nio.file.StandardCopyOption
         description = 'Why we ask: on large instances the report can take a while, and browsers or proxies often stop waiting ' +
                 '(commonly after about 60 seconds), losing the result. After this many seconds the report stops reading, ' +
                 'shows what it has, and marks anything it did not read as "Not read" so you can re-run. ' +
-                'Effect: lower = safer but may leave scripts unread; higher = more complete but riskier. Blank = 50. Maximum 300 unless raised in the script\'s advanced settings (TIME_BUDGET_MAX_SEC). ' +
-                'Only go above 60 if your proxy or load balancer waits longer. If the browser gives up first, the run still finishes and saves its report: use option 4 to see it.')
+                'Effect: lower = safer but may leave scripts unread; higher = more complete but riskier. Blank = 50. Maximum 1200. No change inside the script is needed. ' +
+                'For more than 60, open Jira on one node\'s own address (not through the load balancer), off-peak. If the browser gives up first, the run still finishes and saves its report: use option 4 to see it.')
 Integer FORM_TIME_BUDGET
 
 @NumberInput(label = '2. Treat a ScriptRunner script as unused after (days)',
         description = 'Why we ask: scripts that have not run recently are worth considering for archiving or deleting ' +
-                'instead of converting, which can shrink the migration. Scripts with no recorded run in this many days are listed under Archive or delete. ' +
+                'instead of converting, which can shrink the migration. Scripts with no recorded run in this many days are listed under Archive (disable). ' +
                 'Effect: shorter = more scripts flagged as unused; longer = fewer. Widen it (e.g. 365) to catch yearly scripts. Blank = 90.')
 Integer FORM_DORMANT_DAYS
 
@@ -147,14 +157,12 @@ Map<String, String> SR_LISTENER_NAMES = [:]
 // ╔══════════════════════════════════════════════════════════════════════╗
 // ║  ADVANCED SETTINGS — most users never need to change these           ║
 // ╚══════════════════════════════════════════════════════════════════════╝
-// Upper limit for form option 1 (maximum run time). Not a Jira or ScriptRunner limit:
-// the report is returned in the same browser request, so it is lost once the browser,
-// proxy or load balancer stops waiting (often about 60 seconds), while the run keeps
-// using a Jira request thread. Raise only if you know your proxy waits longer.
-// Raising it also lengthens how long the one-run-at-a-time lock waits after a cut-short run.
-// Since v2.1.0 the finished report is also saved to a file (form option 4 shows it), so a
-// report lost by the browser can still be seen once the run finishes.
-int  TIME_BUDGET_MAX_SEC = 300
+// Upper limit for form option 1 (maximum run time). Not a Jira or ScriptRunner limit.
+// v2.4.0: raised from 300 to 1200 so customers set the time with option 1 only and never
+// edit the script. The default stays 50 seconds. The report is returned in the same browser
+// request, so a long run may lose the page, but the finished report is saved to a file
+// (form option 4 shows it). A run uses one Jira request thread for its whole time.
+int  TIME_BUDGET_MAX_SEC = 1200
 int  TIME_BUDGET_SEC = (FORM_TIME_BUDGET && FORM_TIME_BUDGET > 0) ? Math.min(FORM_TIME_BUDGET as int, TIME_BUDGET_MAX_SEC) : 50
 boolean TIME_BUDGET_CAPPED = FORM_TIME_BUDGET && FORM_TIME_BUDGET > TIME_BUDGET_MAX_SEC
 
@@ -193,8 +201,14 @@ def phasesText = { -> srPhaseSec.collect { String k, Double v -> "${k} ${String.
 // configuration, and it clears itself at the end of the run, or after the time below
 // if a run was cut short.
 final String RUN_LOCK_KEY = 'adaptavist.srMigrationReadiness.runningSince'
-final long   RUN_LOCK_MAX_AGE_MS = (TIME_BUDGET_MAX_SEC + 300) * 1000L   // the cap plus 5 minutes (10 minutes by default)
-String prevRunStart = System.getProperty(RUN_LOCK_KEY)
+// v2.4.0: the lock holds "start:budget", so it expires after the run that set it (its own time
+// limit plus 5 minutes), not after the maximum. A value from an older version (start only)
+// is treated as the old 300-second cap.
+String prevRunRaw   = System.getProperty(RUN_LOCK_KEY)
+String prevRunStart = prevRunRaw?.tokenize(':')?.getAt(0)
+String prevBudget   = prevRunRaw?.tokenize(':')?.getAt(1)
+long   prevBudgetSec = prevBudget?.isLong() ? prevBudget.toLong() : 300L
+final long   RUN_LOCK_MAX_AGE_MS = (prevBudgetSec + 300L) * 1000L
 boolean runInProgress = prevRunStart?.isLong() && (RUN_START - prevRunStart.toLong()) < RUN_LOCK_MAX_AGE_MS
 
 // ── Saved report (v2.1.0) ────────────────────────────────────────────────────
@@ -244,7 +258,7 @@ if (runInProgress) {
     def savedHtml = showSaved("A run started at ${new Date(prevRunStart.toLong()).format('HH:mm:ss')} is still going. This saved report is from an EARLIER run, not the one in progress.".toString())
     return savedHtml ? (lockMsg.toString() + savedHtml.toString()) : lockMsg
 }
-System.setProperty(RUN_LOCK_KEY, RUN_START.toString())
+System.setProperty(RUN_LOCK_KEY, "${RUN_START}:${TIME_BUDGET_SEC}".toString())
 
 // ── Service lookups ──────────────────────────────────────────────────────────
 def appProps        = ComponentAccessor.getApplicationProperties()
@@ -259,7 +273,7 @@ def warn     = { String msg -> log.warn "    ⚠ ${msg}" }
 def done     = { String msg -> log.info "    ✔ ${msg}" }
 
 log.info "============================================================"
-log.warn "  SCRIPTRUNNER USAGE REPORT — BEST-EFFORT POC (v2.3.0)"
+log.warn "  SCRIPTRUNNER USAGE REPORT — BEST-EFFORT POC (v2.4.0)"
 log.info "  ${new Date().format('yyyy-MM-dd HH:mm:ss z')}"
 log.info "============================================================"
 
@@ -511,6 +525,9 @@ try {
         // Any unread file for this script (e.g. one node read, another cut off by the time limit)
         // means usage is incomplete, so it is never judged unused.
         else if (srRrdUnavailable || ks.any { String k -> srNotReadKeys.contains(k) || srUnreadableKeys.contains(k) }) status = 'NOT READ'
+        // v2.4.0: judged from file date only. A usage file is only written when its script runs,
+        // so the script ran at some point, just not in the window: not used recently, not never run.
+        else if (d?.ageOnly)        status = 'DORMANT'
         // No usage file and a file with no recorded run mean the same thing: no run found.
         else if (d == null || (d.last as long) == 0L) status = 'NEVER RUN'
         else                        status = 'DORMANT'
@@ -872,11 +889,11 @@ def srGroupOf = { Map r ->
     return 'NODATA'
 }
 String SR_DAYS_TXT = (SR_DORMANT_DAYS as int) == 1 ? '1 day' : "${SR_DORMANT_DAYS} days".toString()
-// Decision first: Keep, Archive or delete, or Check first. Every script is in exactly one group.
+// Decision first: Keep, Archive (disable), or Check first. Every script is in exactly one group.
 List<Map> SR_GROUPS = [
-        [key: 'RETIRE', decision: 'ARCHIVE', word: 'ARCHIVE / DELETE', colour: '#FF8B00', text: '#172B4D', title: 'Archive or delete (after the owner agrees)',
-         action: 'Archive or delete if the owner agrees',
-         explain: "No run recorded in the last ${SR_DAYS_TXT}. If the owner agrees it is no longer needed, archive it (disable it, which keeps a copy) or delete it, on Data Center, before the Script Registry export.".toString()],
+        [key: 'RETIRE', decision: 'ARCHIVE', word: 'ARCHIVE', colour: '#FF8B00', text: '#172B4D', title: 'Archive (disable), after the owner agrees',
+         action: 'Archive (disable) if the owner agrees',
+         explain: "No run recorded in the last ${SR_DAYS_TXT}. If the owner agrees it is no longer needed, disable it on Data Center (this keeps a copy) before the Script Registry export. Do not delete yet.".toString()],
         [key: 'INUSE', decision: 'KEEP', word: 'KEEP', colour: '#00875A', text: '#FFFFFF', title: 'Keep (in use)',
          action: 'Keep',
          explain: "Ran at least once in the last ${SR_DAYS_TXT}. Keep it. ScriptRunner Migration Suite Analyse and Assess decides how it moves to Cloud.".toString()],
@@ -894,7 +911,7 @@ List<Map> SR_GROUPS = [
          explain: "Usage files whose ID matches no current ScriptRunner script, that ran in the last ${SR_DAYS_TXT} or could not be read. Usually a script deleted or changed recently. Check before ignoring.".toString()],
         [key: 'LEFTOVER', decision: 'NONE', word: 'LEFT OVER', colour: '#B3D4FF', text: '#172B4D', title: 'No action: left over from deleted or changed scripts',
          action: 'No action: left-over usage file',
-         explain: "Usage files whose ID matches no current ScriptRunner script, with no run in the last ${SR_DAYS_TXT}. Most likely left over: ScriptRunner keeps these files after a script is deleted or changed. Nothing to convert, archive or delete in ScriptRunner. If you recognise one as a current script, treat it as Archive or delete.".toString()],
+         explain: "Usage files whose ID matches no current ScriptRunner script, with no run in the last ${SR_DAYS_TXT}. Most likely left over: ScriptRunner keeps these files after a script is deleted or changed. Nothing to convert, archive or delete in ScriptRunner. If you recognise one as a current script, treat it as Archive (disable).".toString()],
 ]
 Map<String, List<Map>> srRowsByGroup = SR_GROUPS.collectEntries { [(it.key): []] }
 srRows.each { Map r -> srRowsByGroup[srGroupOf(r)] << r }
@@ -931,7 +948,7 @@ if (srBudgetHit || srListCut) problems << [level: 'warn',
         what: ([srMatchedNotRead ? "usage of ${srMatchedNotRead} script(s) not read" : null,
                 srUnmatchedNotRead ? "${srUnmatchedNotRead} unmatched usage ID(s) not read" : null,
                 srListCut ? "some ${srListCut.join(' and ')} not listed" : null].findAll().join(', ') + " — the ${TIME_BUDGET_SEC}s time limit was reached.").toString(),
-        fix: ("Raise the time limit (option 1, up to ${TIME_BUDGET_MAX_SEC}s) and re-run, off-peak. " +
+        fix: ("Raise option 1 (up to ${TIME_BUDGET_MAX_SEC}s, no script change needed) and re-run once, off-peak, on one node's own address. " +
               'If the page times out before the report appears, wait for the run to finish, then type yes in option 4 to see the saved report.').toString()]
 if (srUnreadableKeys) problems << [level: 'warn', what: "${srUnreadableKeys.size()} usage file(s) could not be read. Those scripts show as \"Not read\".".toString(),
         fix: 'Usually a file being written at that moment: re-run. If the same files fail again, send the Jira log to your Adaptavist contact.']
@@ -940,7 +957,7 @@ if (srMissingDs) problems << [level: 'warn', what: "${srMissingDs.size()} usage 
 if (srMap == null && srMapError && !srFailed && !srRrdUnavailable) problems << [level: 'info', what: "ScriptRunner's own script list could not be read (${srMapError}).".toString(),
         fix: 'Listeners are not named and left-over usage files are not separated. Name listeners with option 3, or send this report to your Adaptavist contact.']
 if (TIME_BUDGET_CAPPED) problems << [level: 'info', what: "The time limit asked for was above ${TIME_BUDGET_MAX_SEC}s, so ${TIME_BUDGET_MAX_SEC}s was used.".toString(),
-        fix: 'The browser usually gives up long before that, losing the report. If your proxy waits longer, raise TIME_BUDGET_MAX_SEC in the script\'s advanced settings.']
+        fix: 'Use 1200 or less. If the page times out, the run still finishes: type yes in option 4 to see the saved report.']
 
 // ═══════════════════════════════════════════════════════════════════════════
 // HTML REPORT
@@ -1008,6 +1025,19 @@ reportHtml = OutputFormatter.markupBuilder { builder ->
             mkp.yield([baseUrl ?: null, "Jira ${jiraVersion} (build ${buildNumber})".toString(),
                        "ScriptRunner ${srVersion}", "Generated ${new Date().format('yyyy-MM-dd HH:mm z')}"].findAll().join('  ·  '))
         }
+        // ── v2.4.0: incomplete banner, first thing on the page ──
+        if (srRrdUnavailable || srFailed) {
+            div(style: 'border:3px solid #DE350B;background:#FFEBE6;border-radius:6px;padding:10px 16px;margin:6px 0 10px;font-size:14px') {
+                b('Report not usable. ')
+                mkp.yield 'ScriptRunner usage could not be read, so no decision can be made from this report. See Problems in this run below.'
+            }
+        } else if (srNotReadKeys || srUnreadableKeys || srNodesMissing || srClusterCheckFailed || srListCut) {
+            div(style: 'border:3px solid #FF8B00;background:#FFFAE6;border-radius:6px;padding:10px 16px;margin:6px 0 10px;font-size:14px') {
+                b('Report incomplete: some usage was not read. ')
+                mkp.yield 'Keep and Archive (disable) are still safe to use: anything not read is under Check first, never under Archive. ' +
+                        'To read the rest, follow the fix in Problems in this run below and run once more.'
+            }
+        }
         // ── Problems in this run, each with its fix (only when there are any) ──
         if (problems) {
             boolean anyError = problems.any { it.level == 'error' }
@@ -1018,7 +1048,7 @@ reportHtml = OutputFormatter.markupBuilder { builder ->
                 div(style: 'font-size:15px;font-weight:bold;margin-bottom:4px') {
                     mkp.yield(((anyError || anyWarn) ? 'Problems in this run, and how to fix them' : 'Notes on this run') as String)
                 }
-                p(style: 'font-size:12px;margin:0 0 6px') { mkp.yield 'Nothing in Jira was changed. Scripts with unknown usage are never shown as "Archive or delete".' }
+                p(style: 'font-size:12px;margin:0 0 6px') { mkp.yield 'Nothing in Jira was changed. Scripts with unknown usage are never shown as "Archive (disable)".' }
                 table(style: 'width:100%;border-collapse:collapse;font-size:13px') {
                     thead { tr { th(scope: 'col', style: 'text-align:left;padding:4px;width:45%', 'What happened'); th(scope: 'col', style: 'text-align:left;padding:4px', 'How to fix it') } }
                     tbody {
@@ -1083,8 +1113,8 @@ reportHtml = OutputFormatter.markupBuilder { builder ->
             }
             div(style: 'display:flex;flex-wrap:wrap;gap:10px;margin:0 0 10px') {
                 tile('#00875A', '#E3FCEF', nKeep, 'Keep', "Ran in the last ${SR_DAYS_TXT}. Keep and convert with ScriptRunner Migration Suite.".toString())
-                tile('#FF8B00', '#FFFAE6', nArchive, 'Archive or delete', "No run in the last ${SR_DAYS_TXT}. If the owner agrees, archive (disable) or delete on Data Center before export.".toString())
-                tile('#6B778C', '#F4F5F7', nCheck, 'Check first', 'Usage unknown. Do not archive or delete until checked.')
+                tile('#FF8B00', '#FFFAE6', nArchive, 'Archive (disable)', "No run in the last ${SR_DAYS_TXT}. If the owner agrees, disable on Data Center before export. Do not delete yet.".toString())
+                tile('#6B778C', '#F4F5F7', nCheck, 'Check first', 'Usage unknown. Do not disable or delete until checked.')
                 if (nLeft) tile('#4C9AFF', '#F4F8FF', nLeft, 'No action: left over', "Usage files of scripts that no longer exist, with no run in the last ${SR_DAYS_TXT}. Nothing to do in ScriptRunner.".toString())
             }
             // Bar: same groups, same colours, same order as the lists below
@@ -1110,7 +1140,7 @@ reportHtml = OutputFormatter.markupBuilder { builder ->
             div(style: 'border-top:2px solid #172B4D;margin:14px 0 4px;padding-top:8px') {
                 div(style: 'font-size:16px;font-weight:bold') { mkp.yield 'Your scripts, by decision' }
                 p(style: 'font-size:13px;margin:2px 0 0') {
-                    mkp.yield "Each coloured bar below is one group (${SR_GROUPS.count { srRowsByGroup[it.key as String] }} in total). Click a bar to show or hide its scripts: on how many days each ran in the last ${SR_DAYS_TXT}, and when it last ran. Archive or delete is already open.".toString()
+                    mkp.yield "Each coloured bar below is one group (${SR_GROUPS.count { srRowsByGroup[it.key as String] }} in total). Click a bar to show or hide its scripts: on how many days each ran in the last ${SR_DAYS_TXT}, and when it last ran. Archive (disable) is already open.".toString()
                 }
             }
 
@@ -1139,14 +1169,16 @@ reportHtml = OutputFormatter.markupBuilder { builder ->
                 mkp.yieldUnescaped("</summary><div>")
                 if (g.key == 'RETIRE' && rs) {
                     div(style: 'background:#FFFAE6;border-left:4px solid #FF8B00;padding:8px 12px;margin:4px 0 8px;font-size:12px') {
-                        b('How to archive or delete safely')
+                        b('Before you act')
                         ol(style: 'margin:4px 0 0;padding-left:18px;line-height:1.5') {
-                            li { mkp.yield "Agree with the script's owner first. Usage is not value: a script that runs once a year can be critical. Not sure? Re-run with option 2 set to 365." }
+                            li { mkp.yield "Agree with the script's owner first. Usage is not value: a script that runs once a quarter or once a year can be critical." }
+                            li { mkp.yield "Check Scheduled Jobs and Escalation Services in this list: if one is set to run less often than every ${SR_DAYS_TXT}, it will look unused here. Keep it.".toString() }
+                            li { mkp.yield 'Disable first, then wait at least one full business cycle (for example a quarter) before removing anything.' }
                             li { mkp.yield 'Keep a copy of the script code before changing anything.' }
                             li { mkp.yield 'Archive = disable it where ScriptRunner offers that. It keeps a copy, and "Export active scripts only" leaves it out of the Script Registry export.' }
                             li { mkp.yield 'Workflow scripts are removed by editing the workflow, which changes live transitions. Your Jira administrator should test this first.' }
                             li { mkp.yield 'Script fields may hold values on issues. Check with your Jira administrator before removing one.' }
-                            li { mkp.yield 'Delete only once the owner agrees and a copy is kept.' }
+                            li { mkp.yield 'Delete only once the owner agrees, a copy is kept, and nothing broke while it was disabled. Deleting cannot be undone.' }
                         }
                     }
                 }
@@ -1186,7 +1218,7 @@ reportHtml = OutputFormatter.markupBuilder { builder ->
                     moreNote(rs.size(), 'Use "Copy the full list" below to get every script.')
                     if (g.key == 'RETIRE') {
                         div(style: 'margin:10px 0 2px;padding:6px 10px;background:#DEEBFF;border-radius:4px;font-size:13px;font-weight:bold') {
-                            mkp.yield ("End of the Archive or delete list. More groups below: Keep (${nKeep}), Check first (${nCheck})" + (nLeft ? ", No action: left over (${nLeft})" : '') + '. Click a bar to open it. ↓').toString()
+                            mkp.yield ("End of the Archive (disable) list. More groups below: Keep (${nKeep}), Check first (${nCheck})" + (nLeft ? ", No action: left over (${nLeft})" : '') + '. Click a bar to open it. ↓').toString()
                         }
                     }
                 }
@@ -1222,7 +1254,7 @@ reportHtml = OutputFormatter.markupBuilder { builder ->
             // Secondary and reference views
             subGroup('By feature type', srByType.size()) {
                 table(class: 'aui', style: 'width:100%') {
-                    thead { tr { th(scope: 'col', 'Feature type'); th(scope: 'col', style: 'text-align:right', 'Scripts'); th(scope: 'col', style: 'text-align:right', 'In use'); th(scope: 'col', style: 'text-align:right', 'Archive or delete') } }
+                    thead { tr { th(scope: 'col', 'Feature type'); th(scope: 'col', style: 'text-align:right', 'Scripts'); th(scope: 'col', style: 'text-align:right', 'In use'); th(scope: 'col', style: 'text-align:right', 'Archive (disable)') } }
                     tbody {
                         srByType.each { Map t ->
                             tr { td(t.type as String); td(style: 'text-align:right', t.total as String); td(style: 'text-align:right', t.active as String); td(style: 'text-align:right', t.retire as String) }
@@ -1274,7 +1306,7 @@ reportHtml = OutputFormatter.markupBuilder { builder ->
             b('Next steps: how this report fits your ScriptRunner migration')
             p(style: 'margin:4px 0 0') { mkp.yield 'Best used before the Script Registry export, so retired scripts are never analysed or converted. Already ran ScriptRunner Migration Suite Analyse and Assess? Use both together, then export and analyse again after retiring scripts.' }
             ol(style: 'margin:6px 0 0;padding-left:20px') {
-                li(style: 'margin-bottom:4px') { b('Archive or delete unused scripts on Data Center — '); mkp.yield 'review the "Archive or delete" list with owners, and disable or delete anything no longer needed. This report narrows the list; it does not assess migratability.' }
+                li(style: 'margin-bottom:4px') { b('Archive (disable) unused scripts on Data Center — '); mkp.yield 'review the "Archive (disable)" list with owners, and disable anything no longer needed. Delete only later, once nothing broke. This report narrows the list; it does not assess migratability.' }
                 li(style: 'margin-bottom:4px') {
                     b('Script Registry export — '); mkp.yield "choose \"Export active scripts only\", so disabled (retired) scripts are left out. Script roots, and saved JQL filters that use ScriptRunner JQL functions, are always included (${yesNo(exportAvailable)}). "
                     extLink('https://docs.adaptavist.com/sr4js/latest/features/script-registry', 'Script Registry docs')
@@ -1300,7 +1332,7 @@ reportHtml = OutputFormatter.markupBuilder { builder ->
                     row('Maximum run time', "${TIME_BUDGET_SEC}s".toString(), "The run took ${String.format('%.1f', (RUN_END - RUN_START) / 1000d)}s. " +
                             ((srBudgetHit || srListCut) ? 'The time limit was reached: see Problems in this run.' : 'The time limit was not reached.'))
                     row('Time per step', phasesText() ?: '—', 'How long each step took. Building and saving the report is in the Jira log (RUN COMPLETE line).')
-                    row('Unused after', "${SR_DORMANT_DAYS} days".toString(), "Scripts with no recorded run in ${SR_DORMANT_DAYS} days are listed under \"Archive or delete\".")
+                    row('Unused after', "${SR_DORMANT_DAYS} days".toString(), "Scripts with no recorded run in ${SR_DORMANT_DAYS} days are listed under \"Archive (disable)\".")
                     row('Listener names', SR_LISTENER_NAMES ? "${SR_LISTENER_NAMES.size()} entered".toString() : 'none',
                             srMap != null ? 'Listeners are named from ScriptRunner\'s own list' + (SR_LISTENER_NAMES ? '; names entered here are used first.' : '.')
                                     : (SR_LISTENER_NAMES ? 'Matching listeners are shown by name.' : 'Listeners (if any) are shown as "Not matched".'))
