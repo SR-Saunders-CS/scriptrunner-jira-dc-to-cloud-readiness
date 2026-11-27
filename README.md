@@ -13,14 +13,24 @@ For each ScriptRunner script on Data Center:
 - whether it ran in the last N days (default 90)
 - roughly when it last ran (UTC date), taken from the last-changed date of ScriptRunner's own usage file
 
-It never opens ScriptRunner's usage files, so it can't get in the way of ScriptRunner writing them. It shows usage only. It never says whether a script can move to Cloud.
+It never opens ScriptRunner's usage files, so it can't get in the way of ScriptRunner writing them.
+
+## What it doesn't do
+
+- **Decide for you.** It shows metrics. You and each script's owner decide.
+- **Prove a script is safe to remove.** No recent run is not the same as not needed.
+- **Count runs.** It shows the last run date only.
+- **Show usage for every script.** Some show as "Usage unknown", and some feature types aren't included (see [What's covered](#whats-covered)).
+- **Assess Cloud migration.** It never says whether or how a script moves to Cloud. Use ScriptRunner Migration Suite Analyse and Assess for that.
+- **Change anything.** It never disables, archives or deletes a script.
+- **Work on Cloud, or come with support.** Data Center only, best effort, not covered by Adaptavist Support.
 
 [![Example report: ScriptRunner scripts grouped by usage](report_migration.png)](report_migration.png)
 
 ## Where it fits
 
-1. Run this report and review the "No run in last N days, archive candidate" list with script owners.
-2. If you decide a script is no longer needed, disable it (archive). Delete only later, once nothing broke while it was disabled.
+1. Run this report and share the "No run in last N days, archive candidate" list with script owners.
+2. Owners decide what is still needed. If you choose to remove a script, archiving (disabling) it first keeps a copy and can be undone; deleting cannot.
 3. Script Registry export ("Export active scripts only").
 4. [ScriptRunner Migration Suite Analyse and Assess](https://docs.adaptavist.com/sms/latest/scriptrunner-migration-suite-web-app/scriptrunner-migration-analyse-and-assess-tool) (always do this).
 5. Convert with the [ScriptRunner Migration Suite Migration Agent](https://docs.adaptavist.com/sms/latest/scriptrunner-migration-suite-web-app/scriptrunner-migration-agent), deploy with the [Dev and Deployment Tool](https://docs.adaptavist.com/sms/latest/scriptrunner-dev-and-deployment-tool).
@@ -65,7 +75,7 @@ It lists your script names, so share it securely and delete copies when done.
 |---|---|---|---|
 | 1 | Maximum run time (seconds) | 50 | Browsers and proxies often give up after about 60 s. At this limit the report stops listing and marks anything not covered as "Not read". Up to 1200, set here only (no change inside the script). On large instances, use 600, off-peak, on one node's own address (not through the load balancer). |
 | 2 | Window (days) | 90 | Scripts with no run in this many days are listed as "No run in last N days, archive candidate". Widen it (e.g. 365) to catch quarterly or yearly scripts. |
-| 3 | Script Listener names | blank | Usually not needed: since 2.2.0 listeners are named automatically. Only use it if the report says ScriptRunner's own script list couldn't be read. Format: `uuid=Name; uuid=Name`. |
+| 3 | Script Listener names | blank | Usually not needed: listeners are named automatically. Only use it if the report says ScriptRunner's own script list couldn't be read. Format: `uuid=Name; uuid=Name`. |
 | 4 | Show the last saved report | blank | Type `yes` to show the last saved report straight away, without running anything. Use it when the page timed out or showed an error before the report appeared. |
 
 ## Reading the report
@@ -81,7 +91,7 @@ The top shows four numbers: **Ran in last N days**, **No run in last N days, arc
 | Usage unknown: leftover file, but ran recently or not read | A usage file whose ID matches no current ScriptRunner script, that ran in the window or couldn't be read. Usually a script deleted or changed recently. | Check it isn't a current script before ignoring it. |
 | Leftover usage files | A usage file whose ID matches no current ScriptRunner script, with no run in the window. ScriptRunner keeps these files after a script is deleted or changed. | No script behind it to convert or archive. If you recognise one as a current script, treat it like a script with no recent run. |
 
-If ScriptRunner's own script list can't be read on your version, the report works as in 2.1.0 and shows a "Usage unknown: not matched to a script" group instead of the leftover groups.
+If ScriptRunner's own script list can't be read on your version, the report shows a "Usage unknown: not matched to a script" group instead of the leftover groups.
 
 Each row links to where that script is managed in ScriptRunner admin.
 
@@ -130,63 +140,34 @@ How the data is read, and why: [docs/how-it-works.md](docs/how-it-works.md).
 
 ## If you decide to archive
 
-- Agree with each script's owner. Usage is not value: a script that runs once a quarter or once a year can be critical.
-- Check Scheduled Jobs and Escalation Services in the "No run" list. One set to run less often than the window looks unused here.
-- Disable first. Wait at least one full business cycle (for example a quarter) before removing anything.
-- Delete only once nothing broke while it was disabled. Deleting cannot be undone.
+Things worth considering. The decision is always yours and each script owner's.
+
+- Usage is not value: a script that runs once a quarter or once a year can be critical.
+- Scheduled Jobs and Escalation Services set to run less often than the window will look unused here.
+- Archiving (disabling) keeps a copy and can be undone. Deleting cannot.
+- Many teams wait a full business cycle after archiving before deleting anything, or follow their own deletion policy.
 - If the top of the report says "Report incomplete", the "Ran in last" and "No run in last" lists are still reliable. Anything not read is under Usage unknown.
 
 ## Benchmark
 
-Measured on a large multi-node production cluster with **v2.4.0** (one run, off-peak, on one node's own address, option 1 = 600):
+Measured on a large multi-node production cluster with v2.5.0 (one run, on one node's own address, option 1 = 600):
 
 | | |
 |---|---|
 | Cluster | 10+ nodes, Jira 10.3, ScriptRunner 9.x |
 | Scale | About 16,000 scripts and 30,000 usage files |
-| Total time | About 7 minutes |
-| Slowest step | Reading ScriptRunner's own script list (about half the run) |
+| Total time | About 4.5 minutes |
+| Slowest step | Reading ScriptRunner's own script list (about 70% of the run) |
 | Impact | No slowdown reported |
 | Report file | About 8 MB |
 
-v2.5.0 no longer opens usage files, so expect it to be faster. A v2.5.0 benchmark will be added.
-
 ## Version
 
-2.5.0 (safest):
-- ScriptRunner's usage files are no longer opened. The last-changed date of each usage file is used as the last-run date. Faster, and nothing is read from inside files Jira may be writing.
-- "Days it ran" columns removed (they needed the files to be opened).
-- Groups renamed to describe the data, not a verdict: "Ran in last N days", "No run in last N days, archive candidate", "Usage unknown", "Leftover usage files".
-- Log status names match the report (USAGE UNKNOWN replaces NOT TRACKED and the always-zero NO DATA). "90d" no longer printed twice per line.
-- Listing scripts can use up to 80% of the time limit (was 30%).
-- `READ_THREADS` setting removed.
-
-2.4.0 (safer to act on):
-- Option 1 alone sets the run time, up to 1200 seconds. Nothing in the script needs editing.
-- The one-run-at-a-time lock expires after the run that set it (its time limit plus 5 minutes), not after the maximum.
-- A script judged from its file date shows as DORMANT (ran before, not in the window), not NEVER RUN: a usage file appears to be written only when its script runs.
-- "Archive or delete" is now "Archive (disable)", with a "Before you act" checklist.
-- A banner at the top says when the report is incomplete, and that Keep and Archive (disable) are still safe to use.
-
-2.3.0 (large instances):
-- A usage file not changed for longer than the window (at least 90 days) can't hold a recent run, so when there's no time to open it, it's judged from its file date. Left-over files of that age are never opened.
-- Files are read newest first, by 4 parallel workers (removed in 2.5.0: files are no longer opened).
-- Listing scripts gets its own share of the time limit; finding files no longer uses it up.
-- Key progress lines (time per step, RUN COMPLETE) are logged at WARN, so they reach atlassian-jira.log.
-
-2.2.0:
-- Usage files are matched using ScriptRunner's own list of scripts, so listeners are named automatically.
-- Behaviours show usage, from the scripts inside each behaviour.
-- Usage files of deleted or changed scripts are shown as "left over" instead of "Identify". Before, a deleted REST endpoint or JQL function could appear under "Archive or delete".
-- "No data" has its own colour in the bar.
-
-2.1.0:
-- Scripts are listed first, then their usage files are read first. Files that match no configured script are read only if time remains, so large instances spend their time on scripts that matter.
-- A script with a recent run in any file that was read shows as Keep, even if another node's file for it wasn't read. Before, it showed as "Not read".
+2.5.0:
+- ScriptRunner's usage files are never opened. The last-changed date of each usage file is used as the last-run date.
+- Groups describe the data, not a verdict: "Ran in last N days", "No run in last N days, archive candidate", "Usage unknown", "Leftover usage files". You decide what to do.
+- Shows the last run date only (no run counts).
+- The time limit covers the whole run (option 1, up to 1200 seconds). Nothing in the script needs editing.
 - The finished report is saved to one file and can be shown again with option 4.
-- Workflow conditions whose usage file was skipped by the time limit now show as "Not read", not "No data".
-- 40-character hash IDs are listed under "Identify" instead of being labelled "JQL Function".
-- The time limit covers the whole run: listing gets at most 30% of it, and reading stops early enough to build and save the report.
-- Time taken by each step is shown in the report and the Jira log.
 
-2.0.0: ScriptRunner usage only. The optional wider Jira readiness checks (apps, users, directories, inventory) were removed; they're still in [v1.1.0](https://github.com/SR-Saunders-CS/scriptrunner-jira-dc-to-cloud-readiness/tree/v1.1.0). For Jira-wide counts, use ScriptRunner's [Instance Audit](https://docs.adaptavist.com/sr4js/latest/best-practices/audit-your-jira-instance-using-scriptrunner) built-in script and Atlassian's [pre-migration checklist](https://support.atlassian.com/migration/docs/jira-pre-migration-checklist/).
+For Jira-wide counts, use ScriptRunner's [Instance Audit](https://docs.adaptavist.com/sr4js/latest/best-practices/audit-your-jira-instance-using-scriptrunner) built-in script and Atlassian's [pre-migration checklist](https://support.atlassian.com/migration/docs/jira-pre-migration-checklist/).
